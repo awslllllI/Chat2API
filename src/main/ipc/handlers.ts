@@ -561,6 +561,9 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
     email?: string
     credentials: Record<string, string>
     dailyLimit?: number
+    requestsPerMinute?: number
+    minIntervalMs?: number
+    maxConcurrency?: number
   }): Promise<Account> => {
     return AccountManager.create(data)
   })

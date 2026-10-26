@@ -44,6 +44,8 @@ interface AccountDetailProps {
   onEdit: () => void
   onDelete: () => void
   onValidate: () => Promise<void>
+  /** Called after account is resumed from paused */
+  onResume?: () => Promise<void> | void
 }
 
 export function AccountDetail({
@@ -53,6 +55,7 @@ export function AccountDetail({
   onEdit,
   onDelete,
   onValidate,
+  onResume,
 }: AccountDetailProps) {
   const { t, i18n } = useTranslation()
   const [isValidating, setIsValidating] = useState(false)
@@ -111,9 +114,15 @@ export function AccountDetail({
       bgColor: 'bg-red-100',
       icon: XCircle,
     },
+    paused: {
+      labelKey: 'providers.paused',
+      color: 'text-amber-700',
+      bgColor: 'bg-amber-100',
+      icon: AlertCircle,
+    },
   }
 
-  const config = statusConfig[account.status]
+  const config = statusConfig[account.status] || statusConfig.error
   const StatusIcon = config.icon
 
   const formatDate = (timestamp?: number) => {
@@ -302,6 +311,36 @@ export function AccountDetail({
                     <p className="text-sm font-medium text-red-700">{t('common.error')}</p>
                     <p className="text-sm text-red-600 mt-1">{account.errorMessage}</p>
                   </div>
+                </div>
+              </div>
+            )}
+
+            {account.status === 'paused' && (
+              <div className="mt-4 p-3 bg-amber-50 dark:bg-amber-950/20 rounded-lg">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-start gap-2">
+                    <AlertCircle className="h-4 w-4 text-amber-600 mt-0.5 flex-shrink-0" />
+                    <div>
+                      <p className="text-sm font-medium text-amber-800 dark:text-amber-200">{t('providers.paused')}</p>
+                      <p className="text-sm text-amber-700 dark:text-amber-300 mt-1">
+                        {account.statusReason || account.errorMessage || '-'}
+                      </p>
+                    </div>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={async () => {
+                      await window.electronAPI.accounts.update(account.id, {
+                        status: 'active',
+                        errorMessage: undefined,
+                        statusReason: undefined,
+                      })
+                      await onResume?.()
+                    }}
+                  >
+                    {t('providers.resumeAccount')}
+                  </Button>
                 </div>
               </div>
             )}

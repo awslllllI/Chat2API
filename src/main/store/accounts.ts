@@ -6,6 +6,7 @@
 import { storeManager } from './store'
 import { Account, AccountStatus, ValidationResult } from './types'
 import { validateCredentials } from './validator'
+import { getCreateDefaultsForProvider } from '../proxy/rateLimitDefaults'
 
 /**
  * Account Manager class
@@ -57,6 +58,9 @@ export class AccountManager {
     email?: string
     credentials: Record<string, string>
     dailyLimit?: number
+    requestsPerMinute?: number
+    minIntervalMs?: number
+    maxConcurrency?: number
   }): Account {
     // Ensure provider exists before creating account
     storeManager.ensureProviderExists(data.providerId)
@@ -66,6 +70,8 @@ export class AccountManager {
     if (!provider) {
       throw new Error(`Provider not found: ${data.providerId}`)
     }
+
+    const rateDefaults = getCreateDefaultsForProvider(data.providerId)
     
     const now = Date.now()
     const account: Account = {
@@ -80,6 +86,11 @@ export class AccountManager {
       requestCount: 0,
       todayUsed: 0,
       dailyLimit: data.dailyLimit,
+      requestsPerMinute:
+        data.requestsPerMinute !== undefined ? data.requestsPerMinute : rateDefaults.requestsPerMinute,
+      minIntervalMs: data.minIntervalMs !== undefined ? data.minIntervalMs : rateDefaults.minIntervalMs,
+      maxConcurrency:
+        data.maxConcurrency !== undefined ? data.maxConcurrency : rateDefaults.maxConcurrency,
       lastStatusCheck: now,
       lastUsed: now,
     }
@@ -157,7 +168,33 @@ export class AccountManager {
     status: AccountStatus,
     errorMessage?: string
   ): Account | null {
-    return this.update(id, { status, errorMessage })
+    return this.update(id, {
+      status,
+      errorMessage,
+      statusReason: errorMessage,
+    })
+  }
+
+  /**
+   * Pause account after ban/challenge; requires manual resume.
+   */
+  static pause(id: string, reason: string): Account | null {
+    return this.update(id, {
+      status: 'paused',
+      errorMessage: reason,
+      statusReason: reason,
+    })
+  }
+
+  /**
+   * Resume a paused/error account to active and clear gate cooling.
+   */
+  static resume(id: string): Account | null {
+    return this.update(id, {
+      status: 'active',
+      errorMessage: undefined,
+      statusReason: undefined,
+    })
   }
 
   /**

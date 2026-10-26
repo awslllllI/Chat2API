@@ -144,6 +144,9 @@ const accountsAPI = {
     email?: string
     credentials: Record<string, string>
     dailyLimit?: number
+    requestsPerMinute?: number
+    minIntervalMs?: number
+    maxConcurrency?: number
   }): Promise<Account> => 
     ipcRenderer.invoke(IpcChannels.ACCOUNTS_ADD, data),
   

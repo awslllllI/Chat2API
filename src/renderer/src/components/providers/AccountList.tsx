@@ -96,6 +96,12 @@ export function AccountList({
       bgColor: 'bg-red-100',
       icon: X,
     },
+    paused: {
+      labelKey: 'providers.paused',
+      color: 'text-amber-700',
+      bgColor: 'bg-amber-100',
+      icon: AlertCircle,
+    },
   }
 
   const handleValidate = async (id: string) => {
@@ -192,7 +198,7 @@ export function AccountList({
       <ScrollArea className="h-[calc(100vh-400px)]">
         <div className="space-y-3 pr-4">
           {accounts.map((account) => {
-            const config = statusConfig[account.status]
+            const config = statusConfig[account.status] || statusConfig.error
             const StatusIcon = config.icon
             const isValidating = validatingIds.has(account.id)
 

@@ -132,6 +132,9 @@ interface AccountsAPI {
     email?: string
     credentials: Record<string, string>
     dailyLimit?: number
+    requestsPerMinute?: number
+    minIntervalMs?: number
+    maxConcurrency?: number
   }) => Promise<Account>
   update: (id: string, updates: Partial<Account>) => Promise<Account | null>
   delete: (id: string) => Promise<boolean>

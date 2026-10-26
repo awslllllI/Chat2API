@@ -13,6 +13,9 @@ import { streamHandler } from '../stream'
 import { proxyStatusManager } from '../status'
 import { modelMapper } from '../modelMapper'
 import { storeManager } from '../../store/store'
+import { accountGate } from '../accountGate'
+import { resolveAccountRateLimits } from '../rateLimitDefaults'
+import { applyUpstreamFailure, applyEmptySuccessGuard } from '../accountHealth'
 import { 
   isAnthropicToolFormat,
   transformResponseToAnthropic,
@@ -143,27 +146,52 @@ router.post('/completions', async (ctx: Context) => {
   const preferredProviderId = modelMapper.getPreferredProvider(request.model)
   const preferredAccountId = modelMapper.getPreferredAccount(request.model)
 
-  const selection = loadBalancer.selectAccount(
+  const selectResult = loadBalancer.selectAccountDetailed(
     request.model,
     config.loadBalanceStrategy,
     preferredProviderId,
     preferredAccountId
   )
+  const selection = selectResult.selection
 
   if (!selection) {
-    ctx.status = 503
+    const retryAfter = selectResult.retryAfterSeconds || 5
+    ctx.status = 429
+    ctx.set('Retry-After', String(retryAfter))
     ctx.body = {
       error: {
-        message: `No available account for model: ${request.model}`,
-        type: 'service_unavailable_error',
+        message: `No available account for model: ${request.model}. Same-provider accounts are rate-limited, cooling, or paused. Retry after ${retryAfter}s.`,
+        type: 'rate_limit_error',
         param: null,
         code: 'no_available_account',
+        retry_after: retryAfter,
       },
     }
     return
   }
 
   const { account, provider, actualModel } = selection
+  const rateLimits = resolveAccountRateLimits(provider.id, account)
+
+  if (!accountGate.tryAcquire(account.id, rateLimits)) {
+    // Race: gate filled after select — ask client to retry shortly (do not cross provider)
+    const retryAfter = Math.min(
+      Math.max(Math.ceil((rateLimits.minIntervalMs || 1000) / 1000), 1),
+      15
+    )
+    ctx.status = 429
+    ctx.set('Retry-After', String(retryAfter))
+    ctx.body = {
+      error: {
+        message: `Account temporarily busy for model: ${request.model}. Retry after ${retryAfter}s.`,
+        type: 'rate_limit_error',
+        param: null,
+        code: 'account_busy',
+        retry_after: retryAfter,
+      },
+    }
+    return
+  }
 
   const context: ProxyContext = {
     requestId,
@@ -192,17 +220,27 @@ router.post('/completions', async (ctx: Context) => {
     if (!result.success) {
       proxyStatusManager.recordRequestFailure(latency)
 
-      if (result.status && result.status >= 400 && result.status !== 429) {
-        loadBalancer.markAccountFailed(account.id)
+      const classification = applyUpstreamFailure(account.id, result.status, result.error)
+      const responseStatus =
+        classification.kind === 'rate_limit' || result.status === 429
+          ? 429
+          : result.status || 500
+
+      if (responseStatus === 429) {
+        const retryAfter = Math.min(
+          Math.max(Math.ceil((classification.coolDownMs || 60_000) / 1000), 1),
+          15
+        )
+        ctx.set('Retry-After', String(retryAfter))
       }
 
-      ctx.status = result.status || 500
+      ctx.status = responseStatus
       ctx.body = {
         error: {
           message: result.error || 'Request failed',
-          type: 'api_error',
+          type: responseStatus === 429 ? 'rate_limit_error' : 'api_error',
           param: null,
-          code: null,
+          code: classification.kind,
         },
       }
 
@@ -251,7 +289,12 @@ router.post('/completions', async (ctx: Context) => {
       return
     }
 
-    loadBalancer.clearAccountFailure(account.id)
+    const emptyGuarded =
+      !request.stream && result.body ? applyEmptySuccessGuard(account.id, result.body) : false
+
+    if (!emptyGuarded) {
+      loadBalancer.clearAccountFailure(account.id)
+    }
 
     proxyStatusManager.recordRequestSuccess(latency)
 
@@ -516,6 +559,8 @@ router.post('/completions', async (ctx: Context) => {
     })
 
     storeManager.recordRequestInStats(false, latency, request.model, provider.id, account.id)
+  } finally {
+    accountGate.release(account.id)
   }
 })
 

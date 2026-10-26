@@ -9,8 +9,9 @@ import { DEFAULT_TOOL_CALLING_CONFIG } from '../../shared/toolCalling.ts'
 
 /**
  * Account Status Enum
+ * paused: manual or auto pause after ban/challenge (needs user resume)
  */
-export type AccountStatus = 'active' | 'inactive' | 'expired' | 'error'
+export type AccountStatus = 'active' | 'inactive' | 'expired' | 'error' | 'paused'
 
 /**
  * Provider Type Enum
@@ -115,6 +116,14 @@ export interface Account {
   dailyLimit?: number
   /** Today used count */
   todayUsed?: number
+  /** Sliding-window RPM; undefined = soft provider default; 0 = unlimited */
+  requestsPerMinute?: number
+  /** Min ms between upstream dispatches; undefined = soft default; 0 = unlimited */
+  minIntervalMs?: number
+  /** Max in-flight requests; undefined = soft default; 0 = unlimited */
+  maxConcurrency?: number
+  /** Last status reason (paused/error), user-visible, no secrets */
+  statusReason?: string
 }
 
 /**

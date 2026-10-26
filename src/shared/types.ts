@@ -1,4 +1,4 @@
-export type AccountStatus = 'active' | 'inactive' | 'expired' | 'error'
+export type AccountStatus = 'active' | 'inactive' | 'expired' | 'error' | 'paused'
 
 export type ProviderStatus = 'online' | 'offline' | 'unknown'
 
@@ -49,6 +49,14 @@ export interface Account {
   requestCount?: number
   dailyLimit?: number
   todayUsed?: number
+  /** Sliding-window RPM; undefined = soft provider default; 0 = unlimited */
+  requestsPerMinute?: number
+  /** Min ms between upstream dispatches; undefined = soft default; 0 = unlimited */
+  minIntervalMs?: number
+  /** Max in-flight requests; undefined = soft default; 0 = unlimited */
+  maxConcurrency?: number
+  /** Last status reason (paused/error) */
+  statusReason?: string
 }
 
 export interface Provider {
@@ -277,6 +285,9 @@ export interface CreateAccountRequest {
   email?: string
   credentials: Record<string, string>
   dailyLimit?: number
+  requestsPerMinute?: number
+  minIntervalMs?: number
+  maxConcurrency?: number
 }
 
 export interface UpdateAccountRequest {
@@ -284,6 +295,11 @@ export interface UpdateAccountRequest {
   email?: string
   credentials?: Record<string, string>
   dailyLimit?: number
+  requestsPerMinute?: number
+  minIntervalMs?: number
+  maxConcurrency?: number
+  status?: AccountStatus
+  statusReason?: string
 }
 
 export interface CreateApiKeyRequest {

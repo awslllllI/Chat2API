@@ -122,6 +122,9 @@ interface AddAccountDialogProps {
     email?: string
     credentials: Record<string, string>
     dailyLimit?: number
+    requestsPerMinute?: number
+    minIntervalMs?: number
+    maxConcurrency?: number
   }) => Promise<void>
   onValidateToken: (providerId: string, credentials: Record<string, string>) => Promise<{
     valid: boolean
@@ -150,6 +153,9 @@ export function AddAccountDialog({
   const [activeTab, setActiveTab] = useState<string>('manual')
   const [name, setName] = useState('')
   const [dailyLimit, setDailyLimit] = useState<string>('')
+  const [requestsPerMinute, setRequestsPerMinute] = useState<string>('')
+  const [minIntervalMs, setMinIntervalMs] = useState<string>('')
+  const [maxConcurrency, setMaxConcurrency] = useState<string>('')
   const [credentials, setCredentials] = useState<Record<string, string>>({})
   const [isValidating, setIsValidating] = useState(false)
   const [validationResult, setValidationResult] = useState<{
@@ -176,6 +182,9 @@ export function AddAccountDialog({
       if (editingAccount) {
         setName(editingAccount.name)
         setDailyLimit(editingAccount.dailyLimit?.toString() || '')
+        setRequestsPerMinute(editingAccount.requestsPerMinute?.toString() ?? '')
+        setMinIntervalMs(editingAccount.minIntervalMs?.toString() ?? '')
+        setMaxConcurrency(editingAccount.maxConcurrency?.toString() ?? '')
         setCredentials(editingAccount.credentials || {})
         setActiveTab('manual')
       } else {
@@ -187,11 +196,21 @@ export function AddAccountDialog({
   const resetForm = () => {
     setName('')
     setDailyLimit('')
+    setRequestsPerMinute('')
+    setMinIntervalMs('')
+    setMaxConcurrency('')
     setCredentials({})
     setValidationResult({})
     setActiveTab('manual')
     setIsOAuthLoading(false)
     setOAuthStatus('')
+  }
+
+  /** Parse optional numeric field; empty → undefined; allows 0 for unlimited */
+  const parseOptionalNumber = (value: string): number | undefined => {
+    if (value.trim() === '') return undefined
+    const n = parseInt(value, 10)
+    return Number.isFinite(n) ? n : undefined
   }
 
   const handleCredentialChange = (fieldName: string, value: string) => {
@@ -271,7 +290,10 @@ export function AddAccountDialog({
       const data = {
         name: name.trim(),
         credentials: finalCredentials,
-        dailyLimit: dailyLimit ? parseInt(dailyLimit, 10) : undefined,
+        dailyLimit: parseOptionalNumber(dailyLimit),
+        requestsPerMinute: parseOptionalNumber(requestsPerMinute),
+        minIntervalMs: parseOptionalNumber(minIntervalMs),
+        maxConcurrency: parseOptionalNumber(maxConcurrency),
       }
 
       if (isEditing && editingAccount && onUpdateAccount) {
@@ -373,6 +395,48 @@ export function AddAccountDialog({
                 value={dailyLimit}
                 onChange={(e) => setDailyLimit(e.target.value)}
               />
+            </div>
+
+            <div className="space-y-3 rounded-lg border p-3">
+              <div>
+                <Label>{t('providers.rateLimitSection')}</Label>
+                <p className="text-xs text-muted-foreground mt-1">{t('providers.rateLimitSectionHelp')}</p>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div className="space-y-1">
+                  <Label htmlFor="requestsPerMinute" className="text-xs">{t('providers.requestsPerMinute')}</Label>
+                  <Input
+                    id="requestsPerMinute"
+                    type="number"
+                    min={0}
+                    placeholder={t('providers.requestsPerMinutePlaceholder')}
+                    value={requestsPerMinute}
+                    onChange={(e) => setRequestsPerMinute(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="minIntervalMs" className="text-xs">{t('providers.minIntervalMs')}</Label>
+                  <Input
+                    id="minIntervalMs"
+                    type="number"
+                    min={0}
+                    placeholder={t('providers.minIntervalMsPlaceholder')}
+                    value={minIntervalMs}
+                    onChange={(e) => setMinIntervalMs(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="maxConcurrency" className="text-xs">{t('providers.maxConcurrency')}</Label>
+                  <Input
+                    id="maxConcurrency"
+                    type="number"
+                    min={0}
+                    placeholder={t('providers.maxConcurrencyPlaceholder')}
+                    value={maxConcurrency}
+                    onChange={(e) => setMaxConcurrency(e.target.value)}
+                  />
+                </div>
+              </div>
             </div>
 
             {supportsOAuth && !isEditing && (

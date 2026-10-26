@@ -58,3 +58,6 @@ src/renderer/next-app/
 
 # Backup
 backup/
+
+# Local planning / scratch docs (not tracked)
+todo/

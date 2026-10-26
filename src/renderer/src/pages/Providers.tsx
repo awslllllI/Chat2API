@@ -380,6 +380,9 @@ export function Providers() {
     email?: string
     credentials: Record<string, string>
     dailyLimit?: number
+    requestsPerMinute?: number
+    minIntervalMs?: number
+    maxConcurrency?: number
   }) => {
     if (!store.selectedProviderId) return
     
@@ -390,6 +393,9 @@ export function Providers() {
         email: data.email,
         credentials: data.credentials,
         dailyLimit: data.dailyLimit,
+        requestsPerMinute: data.requestsPerMinute,
+        minIntervalMs: data.minIntervalMs,
+        maxConcurrency: data.maxConcurrency,
       })
       store.addAccount(account)
       
@@ -597,6 +603,17 @@ export function Providers() {
           }}
           onDelete={() => handleDeleteAccount(selectedAccount.id)}
           onValidate={() => handleValidateAccount(selectedAccount.id)}
+          onResume={async () => {
+            store.updateAccount(selectedAccount.id, {
+              status: 'active',
+              errorMessage: undefined,
+              statusReason: undefined,
+            })
+            toast({
+              title: t('providers.updateSuccess'),
+              description: t('providers.accountResumed'),
+            })
+          }}
         />
       </div>
     )
