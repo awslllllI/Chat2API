@@ -1,9 +1,10 @@
 /**
  * Live DeepSeek tool-calling smoke via local Chat2API proxy.
- * Respects min interval between requests. Does not print secrets.
+ * Human Envelope: refuses live upstream unless ALLOW_LIVE_UPSTREAM=1 and
+ * SMOKE_INTERVAL_MS >= 30000 (DeepSeek HCE min interval).
  *
  * Usage:
- *   node scripts/smoke-deepseek-tools.mjs
+ *   ALLOW_LIVE_UPSTREAM=1 SMOKE_INTERVAL_MS=35000 node scripts/smoke-deepseek-tools.mjs
  * Optional env JSON: %TEMP%/chat2api-smoke-env.json { baseUrl, apiKey }
  */
 import fs from 'node:fs'
@@ -17,8 +18,22 @@ const env = fs.existsSync(envPath)
 
 const baseUrl = (process.env.CHAT2API_BASE_URL || env.baseUrl || 'http://127.0.0.1:8082').replace(/\/$/, '')
 const apiKey = process.env.CHAT2API_API_KEY || env.apiKey || ''
-const intervalMs = Number(process.env.SMOKE_INTERVAL_MS || 2000)
+const intervalMs = Number(process.env.SMOKE_INTERVAL_MS || 35_000)
 const model = process.env.CHAT2API_MODEL || env.model || 'deepseek-v4-flash'
+const HCE_MIN_INTERVAL_MS = 30_000
+
+if (process.env.ALLOW_LIVE_UPSTREAM !== '1') {
+  console.error(
+    'smoke-deepseek-tools: refused. Set ALLOW_LIVE_UPSTREAM=1 to hit real accounts (HCE anti-ban).',
+  )
+  process.exit(2)
+}
+if (!Number.isFinite(intervalMs) || intervalMs < HCE_MIN_INTERVAL_MS) {
+  console.error(
+    `smoke-deepseek-tools: SMOKE_INTERVAL_MS must be >= ${HCE_MIN_INTERVAL_MS} (got ${intervalMs}).`,
+  )
+  process.exit(2)
+}
 
 const tools = [
   {

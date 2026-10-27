@@ -49,12 +49,19 @@ export interface Account {
   requestCount?: number
   dailyLimit?: number
   todayUsed?: number
-  /** Sliding-window RPM; undefined = soft provider default; 0 = unlimited */
+  /** Sliding-window RPM spike fuse; undefined = soft provider default; 0 = unlimited */
   requestsPerMinute?: number
-  /** Min ms between upstream dispatches; undefined = soft default; 0 = unlimited */
+  /** Min ms after turn end before next dispatch; undefined = soft default; 0 = unlimited */
   minIntervalMs?: number
   /** Max in-flight requests; undefined = soft default; 0 = unlimited */
   maxConcurrency?: number
+  /** Rolling-hour turn cap */
+  requestsPerHour?: number
+  burstCapacity?: number
+  burstRefillMs?: number
+  stickyTtlMs?: number
+  sessionCreatesPerHour?: number
+  switchPenaltyMs?: number
   /** Last status reason (paused/error) */
   statusReason?: string
 }
@@ -288,6 +295,12 @@ export interface CreateAccountRequest {
   requestsPerMinute?: number
   minIntervalMs?: number
   maxConcurrency?: number
+  requestsPerHour?: number
+  burstCapacity?: number
+  burstRefillMs?: number
+  stickyTtlMs?: number
+  sessionCreatesPerHour?: number
+  switchPenaltyMs?: number
 }
 
 export interface UpdateAccountRequest {
@@ -298,6 +311,12 @@ export interface UpdateAccountRequest {
   requestsPerMinute?: number
   minIntervalMs?: number
   maxConcurrency?: number
+  requestsPerHour?: number
+  burstCapacity?: number
+  burstRefillMs?: number
+  stickyTtlMs?: number
+  sessionCreatesPerHour?: number
+  switchPenaltyMs?: number
   status?: AccountStatus
   statusReason?: string
 }

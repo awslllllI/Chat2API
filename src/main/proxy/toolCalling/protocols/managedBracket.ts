@@ -19,13 +19,14 @@ export const managedBracketProtocol: ToolProtocolAdapter = {
   renderPrompt(tools) {
     return `## Available Tools
 You can invoke the following developer tools. Tool names are case-sensitive.
+Use real JSON types for arguments (array/object/number/boolean/string); never stringify arrays or objects.
 
 ${renderToolList(tools)}
 
 When calling tools, respond with only this block:
 
 [function_calls]
-[call:exact_tool_name]{"argument":"value"}[/call]
+[call:exact_tool_name]{"file_path":"/path/to/file","content":"hello"}[/call]
 [/function_calls]`
   },
 

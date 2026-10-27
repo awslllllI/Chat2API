@@ -147,6 +147,12 @@ const accountsAPI = {
     requestsPerMinute?: number
     minIntervalMs?: number
     maxConcurrency?: number
+    requestsPerHour?: number
+    burstCapacity?: number
+    burstRefillMs?: number
+    stickyTtlMs?: number
+    sessionCreatesPerHour?: number
+    switchPenaltyMs?: number
   }): Promise<Account> => 
     ipcRenderer.invoke(IpcChannels.ACCOUNTS_ADD, data),
   

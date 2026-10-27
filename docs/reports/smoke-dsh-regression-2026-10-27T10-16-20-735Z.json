@@ -1,0 +1,72 @@
+{
+  "baseUrl": "http://127.0.0.1:8082",
+  "intervalMs": 35000,
+  "results": [
+    {
+      "family": "qwen",
+      "model": "Qwen3.5-Flash",
+      "stream": {
+        "finishReason": "stop",
+        "content": "pong"
+      },
+      "tools": {
+        "mode": "tools",
+        "calls": [
+          {
+            "name": "write",
+            "keys": [
+              "file_path",
+              "content"
+            ]
+          }
+        ]
+      },
+      "ok": true,
+      "errors": []
+    },
+    {
+      "family": "glm",
+      "model": "GLM-5.1",
+      "stream": {
+        "finishReason": "stop",
+        "content": "pong"
+      },
+      "tools": {
+        "mode": "tools",
+        "calls": [
+          {
+            "name": "write",
+            "keys": [
+              "file_path",
+              "content"
+            ]
+          }
+        ]
+      },
+      "ok": true,
+      "errors": []
+    },
+    {
+      "family": "deepseek",
+      "model": "deepseek-v4-flash-search",
+      "stream": null,
+      "tools": null,
+      "ok": true,
+      "errors": [
+        "stream skipped: stream status 429 exhausted 429 waits"
+      ],
+      "skipped": "account_risk_or_unavailable"
+    },
+    {
+      "family": "mimo",
+      "model": "MiMo-V2-Flash",
+      "stream": null,
+      "tools": null,
+      "ok": true,
+      "errors": [
+        "stream skipped: {\"error\":{\"message\":\"Mimo failed to save conversation: HTTP 401\",\"type\":\"api_error\",\"param\":null,\"code\":\"other\"}}"
+      ],
+      "skipped": "account_risk_or_auth"
+    }
+  ]
+}

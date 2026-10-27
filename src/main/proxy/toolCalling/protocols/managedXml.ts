@@ -59,13 +59,15 @@ Tool results will be provided as Chat2API XML result blocks:
 
     parseBlocks(parseable, {
       blockPattern: /<\|CHAT2API\|tool_calls>([\s\S]*?)<\/\|CHAT2API\|tool_calls>/g,
-      invokePattern: /<\|CHAT2API\|invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/\|CHAT2API\|invoke>/g,
+      // Attribute capture is loose so GLM corruption like name="xx name="real" still matches.
+      invokePattern: /<\|CHAT2API\|invoke\b([^>]*)>([\s\S]*?)<\/\|CHAT2API\|invoke>/g,
       parameterPattern: /<\|CHAT2API\|parameter\s+name="([^"]+)"\s*>([\s\S]*?)<\/\|CHAT2API\|parameter>/g,
       rawMatches,
       invalidToolNames,
       allowedNames,
       toolCalls,
       tools: context.tools,
+      nameFromOpenAttrs: true,
     })
 
     parseBlocks(parseable, {
@@ -93,8 +95,8 @@ Tool results will be provided as Chat2API XML result blocks:
       })
     }
 
-    // Standalone invoke without tool_calls wrapper (well-formed or broken)
-    if (toolCalls.length === 0) {
+    // Standalone invoke only when no tool_calls wrapper was found (avoid double-scan).
+    if (toolCalls.length === 0 && rawMatches.length === 0) {
       parseStandaloneInvokes(parseable, {
         rawMatches,
         invalidToolNames,
@@ -154,6 +156,8 @@ interface ParseBlockOptions {
   allowedNames: Set<string>
   toolCalls: ReturnType<typeof buildToolCall>[]
   tools: ToolParseContext['tools']
+  /** When true, group1 is raw open-tag attrs; name is recovered via extractInvokeName. */
+  nameFromOpenAttrs?: boolean
 }
 
 /**
@@ -168,7 +172,10 @@ function parseBlocks(content: string, options: ParseBlockOptions): void {
     options.invokePattern.lastIndex = 0
 
     while ((invokeMatch = options.invokePattern.exec(blockMatch[1])) !== null) {
-      const name = invokeMatch[1].trim()
+      const name = options.nameFromOpenAttrs
+        ? extractInvokeName(invokeMatch[0]).trim()
+        : (extractInvokeName(invokeMatch[0]) || invokeMatch[1] || '').trim()
+      if (!name) continue
       if (!options.allowedNames.has(name)) {
         options.invalidToolNames.push(name)
         continue
@@ -180,6 +187,8 @@ function parseBlocks(content: string, options: ParseBlockOptions): void {
       while ((parameterMatch = options.parameterPattern.exec(invokeMatch[2])) !== null) {
         addParameter(args, parameterMatch[1].trim(), parseJsonValue(parameterMatch[2]))
       }
+      // Also recover parameters when closing tags are mangled (</<|CHAT2API|...).
+      mergeLooseParameters(args, invokeMatch[2])
 
       const guarded = enforceRequiredToolArguments(name, args, options.tools)
       options.toolCalls.push(
@@ -196,8 +205,39 @@ function parseBlocks(content: string, options: ParseBlockOptions): void {
 }
 
 /**
+ * Extract tool name from an invoke open tag; tolerate GLM double-name corruption.
+ */
+function extractInvokeName(rawInvoke: string): string {
+  const beforeClose = rawInvoke.match(/name="([^"]+)"\s*>/)
+  if (beforeClose?.[1]?.trim()) return beforeClose[1].trim()
+  const openEnd = rawInvoke.indexOf('>')
+  const open = openEnd >= 0 ? rawInvoke.slice(0, openEnd + 1) : rawInvoke
+  const all = [...open.matchAll(/name="([^"]*)"/g)].map((m) => m[1].trim()).filter(Boolean)
+  return all[all.length - 1] || ''
+}
+
+/**
+ * Recover parameter values from mangled Chat2API markup inside an invoke body.
+ */
+function mergeLooseParameters(args: Record<string, unknown>, body: string): void {
+  if (!body) return
+  const loose =
+    /(?:<\|CHAT2API\||\|CHAT2API\|)parameter\s+name="([^"]+)"\s*>([\s\S]*?)(?:<\/\|CHAT2API\|parameter>|<\/<\|CHAT2API\|parameter>|<\/\|CHAT2API\|parameter|<\|CHAT2API\|parameter|(?=<\|CHAT2API\|invoke)|(?=\|CHAT2API\|invoke)|$)/gi
+  let match: RegExpExecArray | null
+  while ((match = loose.exec(body)) !== null) {
+    const key = match[1].trim()
+    if (!key || args[key] !== undefined) continue
+    addParameter(args, key, parseJsonValue(match[2]))
+  }
+}
+
+/**
  * Parse standalone invoke blocks without a tool_calls wrapper.
  * Supports well-formed `<|CHAT2API|invoke>` and broken `|CHAT2API|invoke`.
+ *
+ * IMPORTANT: closing tags are required. A trailing `$` alternative would match
+ * incomplete streaming buffers like `<|CHAT2API|invoke name="pwsh">` and emit
+ * empty `{}` args before parameters arrive (seen in DeepSeek+dsh sessions).
  */
 function parseStandaloneInvokes(
   content: string,
@@ -205,21 +245,16 @@ function parseStandaloneInvokes(
 ): void {
   const patterns: Array<{ invoke: RegExp; parameter: RegExp }> = [
     {
-      invoke:
-        /<\|CHAT2API\|invoke\s+name="([^"]+)"\s*>([\s\S]*?)(?:<\/\|CHAT2API\|invoke>|(?=<\|CHAT2API\|invoke)|$)/g,
-      parameter:
-        /<\|CHAT2API\|parameter\s+name="([^"]+)"\s*>([\s\S]*?)(?:<\/\|CHAT2API\|parameter>|(?=<\|CHAT2API\|parameter)|(?=<\|CHAT2API\|invoke)|$)/g,
+      invoke: /<\|CHAT2API\|invoke\b([^>]*)>([\s\S]*?)<\/\|CHAT2API\|invoke>/g,
+      parameter: /<\|CHAT2API\|parameter\s+name="([^"]+)"\s*>([\s\S]*?)<\/\|CHAT2API\|parameter>/g,
     },
     {
-      invoke:
-        /(?<!<)\|CHAT2API\|invoke\s+name="([^"]+)"\s*>([\s\S]*?)(?:<\/\|CHAT2API\|invoke>|(?=\|CHAT2API\|invoke)|$)/g,
-      parameter:
-        /\|CHAT2API\|parameter\s+name="([^"]+)"\s*>([\s\S]*?)(?:<\/\|CHAT2API\|parameter>|(?=\|CHAT2API\|parameter)|(?=\|CHAT2API\|invoke)|$)/g,
+      invoke: /(?<!<)\|CHAT2API\|invoke\b([^>]*)>([\s\S]*?)<\/\|CHAT2API\|invoke>/g,
+      parameter: /\|CHAT2API\|parameter\s+name="([^"]+)"\s*>([\s\S]*?)<\/\|CHAT2API\|parameter>/g,
     },
     {
-      invoke: /<invoke\s+name="([^"]+)"\s*>([\s\S]*?)(?:<\/invoke>|(?=<invoke)|$)/g,
-      parameter:
-        /<parameter\s+name="([^"]+)"\s*>([\s\S]*?)(?:<\/parameter>|(?=<parameter)|(?=<invoke)|$)/g,
+      invoke: /<invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/invoke>/g,
+      parameter: /<parameter\s+name="([^"]+)"\s*>([\s\S]*?)<\/parameter>/g,
     },
   ]
 
@@ -227,32 +262,54 @@ function parseStandaloneInvokes(
     let invokeMatch: RegExpExecArray | null
     while ((invokeMatch = pattern.invoke.exec(content)) !== null) {
       options.rawMatches.push(invokeMatch[0])
-      const name = invokeMatch[1].trim()
+      const name = (extractInvokeName(invokeMatch[0]) || invokeMatch[1] || '').trim()
+      // Reject raw attribute blobs mistaken as names (e.g. ` name="pwsh"`).
+      if (!name || /[= "]/.test(name)) {
+        const recovered = extractInvokeName(invokeMatch[0]).trim()
+        if (!recovered || !options.allowedNames.has(recovered)) {
+          if (recovered) options.invalidToolNames.push(recovered)
+          continue
+        }
+        pushStandaloneCall(options, recovered, invokeMatch[2], invokeMatch[0], pattern.parameter)
+        continue
+      }
       if (!options.allowedNames.has(name)) {
         options.invalidToolNames.push(name)
         continue
       }
-
-      const args: Record<string, unknown> = {}
-      let parameterMatch: RegExpExecArray | null
-      pattern.parameter.lastIndex = 0
-      while ((parameterMatch = pattern.parameter.exec(invokeMatch[2])) !== null) {
-        addParameter(args, parameterMatch[1].trim(), parseJsonValue(parameterMatch[2]))
-      }
-
-      const guarded = enforceRequiredToolArguments(name, args, options.tools)
-      options.toolCalls.push(
-        buildToolCall(
-          `call_${options.toolCalls.length}`,
-          options.toolCalls.length,
-          name,
-          JSON.stringify(guarded),
-          invokeMatch[0],
-        ),
-      )
+      pushStandaloneCall(options, name, invokeMatch[2], invokeMatch[0], pattern.parameter)
     }
     if (options.toolCalls.length > 0) break
   }
+}
+
+/**
+ * Build one standalone tool call from invoke body/parameters.
+ */
+function pushStandaloneCall(
+  options: Omit<ParseBlockOptions, 'blockPattern' | 'invokePattern' | 'parameterPattern'>,
+  name: string,
+  body: string,
+  raw: string,
+  parameterPattern: RegExp,
+): void {
+  const args: Record<string, unknown> = {}
+  let parameterMatch: RegExpExecArray | null
+  parameterPattern.lastIndex = 0
+  while ((parameterMatch = parameterPattern.exec(body)) !== null) {
+    addParameter(args, parameterMatch[1].trim(), parseJsonValue(parameterMatch[2]))
+  }
+  mergeLooseParameters(args, body)
+  const guarded = enforceRequiredToolArguments(name, args, options.tools)
+  options.toolCalls.push(
+    buildToolCall(
+      `call_${options.toolCalls.length}`,
+      options.toolCalls.length,
+      name,
+      JSON.stringify(guarded),
+      raw,
+    ),
+  )
 }
 
 function safeParseObject(value: string): Record<string, unknown> {

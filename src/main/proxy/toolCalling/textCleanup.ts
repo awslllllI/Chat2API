@@ -11,10 +11,14 @@ const CONTROL_TOKEN_PATTERNS: RegExp[] = [
   /<\/?\|end_of_sentence\|>/g,
   /<\|ATls?>?/gi,
   /<\/?\|ATls?>?/gi,
-  // Incomplete Chat2API invoke leaks (missing leading '<')
-  /(?<!<)\|CHAT2API\|invoke[^<\n]*/g,
-  /(?<!<)\|CHAT2API\|tool_calls[^<\n]*/g,
-  /(?<!<)\|CHAT2API\|parameter[^<\n]*/g,
+  // Incomplete / truncated Chat2API marker leaks (seen on Qwen: "2API|tool_calls>", "CHAT2API|tool_calls>")
+  /<\/?\|CHAT2API\|[^<\n]*/gi,
+  /(?<!<)\|CHAT2API\|(?:invoke|tool_calls|parameter|tool_result)[^<\n]*/gi,
+  /(?<!\|)CHAT2API\|(?:tool_calls|invoke|parameter|tool_result)[^<\n]*/gi,
+  // Truncated markers: "2API|parameter name=...<![CDATA[...]]></"
+  /\b2?API\|(?:tool_calls|invoke|parameter|tool_result)[^<\n]*(?:<!\[CDATA\[[\s\S]*?\]\]>)?(?:<\/)?/gi,
+  /<!\[CDATA\[[\s\S]*?\]\]>/g,
+  /\]\]><\/?/g,
 ]
 
 /** Leftover DSML crumbs after a successful parse (or failed incomplete emit). */
@@ -46,6 +50,11 @@ export function stripDsmlCrumbs(text: string): string {
   for (const pattern of DSML_CRUMB_PATTERNS) {
     out = out.replace(pattern, '')
   }
+  // GLM occasionally leaves broken close crumbs.
+  out = out.replace(/<\/<\|CHAT2API\|[^>]*>/g, '')
+  out = out.replace(/<\/<\/+/g, '')
+  out = out.replace(/(?<!\|)CHAT2API\|(?:tool_calls|invoke|parameter|tool_result)[^<\n]*/gi, '')
+  out = out.replace(/\b2?API\|(?:tool_calls|invoke|parameter|tool_result)[^<\n]*/gi, '')
   return out.replace(/\n{3,}/g, '\n\n')
 }
 
@@ -67,6 +76,8 @@ export function looksLikeToolProtocolPrefix(buffer: string): boolean {
   return (
     s.startsWith('<|CHAT2API|') ||
     s.startsWith('|CHAT2API|') ||
+    s.startsWith('CHAT2API|') ||
+    s.startsWith('2API|tool_calls') ||
     s.startsWith('<tool_calls>') ||
     s.startsWith('<｜｜DSML｜｜') ||
     s.startsWith('<｜DSML｜') ||

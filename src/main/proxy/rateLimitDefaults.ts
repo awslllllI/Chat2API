@@ -1,74 +1,44 @@
 /**
- * Per-provider rate-limit defaults for new accounts / unresolved fields.
- * Intentionally loose to avoid false 401/auth churn, but not so loose that
- * clients hit long stalls and stampede-retry. 0 or explicit unset-after-user
- * clear means unlimited at runtime when stored as 0.
+ * Human Conversation Envelope helpers used by main-process gate / persist.
+ * Numeric defaults live in shared so the renderer can prefill the same values.
  */
 
-export interface AccountRateLimitDefaults {
-  /** Sliding-window requests per minute; 0 = unlimited */
-  requestsPerMinute: number
-  /** Minimum ms between upstream dispatches; 0 = unlimited */
-  minIntervalMs: number
-  /** In-flight requests per account; 0 = unlimited */
-  maxConcurrency: number
-}
+export {
+  GENERIC_WEB_RATE_LIMIT_DEFAULTS,
+  LEGACY_LOOSE_DEEPSEEK,
+  PROVIDER_RATE_LIMIT_DEFAULTS,
+  getCreateDefaultsForProvider,
+  type AccountRateLimitDefaults,
+} from '../../shared/rateLimitDefaults.ts'
 
-/** Fallback when provider has no dedicated profile */
-export const GENERIC_WEB_RATE_LIMIT_DEFAULTS: AccountRateLimitDefaults = {
-  requestsPerMinute: 30,
-  minIntervalMs: 1000,
-  maxConcurrency: 1,
+import {
+  GENERIC_WEB_RATE_LIMIT_DEFAULTS,
+  LEGACY_LOOSE_DEEPSEEK,
+  PROVIDER_RATE_LIMIT_DEFAULTS,
+  type AccountRateLimitDefaults,
+} from '../../shared/rateLimitDefaults.ts'
+
+export type AccountRateLimitFields = {
+  requestsPerMinute?: number
+  minIntervalMs?: number
+  maxConcurrency?: number
+  requestsPerHour?: number
+  dailyLimit?: number
+  burstCapacity?: number
+  burstRefillMs?: number
+  stickyTtlMs?: number
+  sessionCreatesPerHour?: number
+  switchPenaltyMs?: number
 }
 
 /**
- * Provider-tuned defaults. DeepSeek is stricter (community ban reports);
- * still kept moderate so Agent tool loops remain usable.
- */
-export const PROVIDER_RATE_LIMIT_DEFAULTS: Record<string, AccountRateLimitDefaults> = {
-  deepseek: {
-    requestsPerMinute: 24,
-    minIntervalMs: 1500,
-    maxConcurrency: 1,
-  },
-  kimi: {
-    requestsPerMinute: 30,
-    minIntervalMs: 1000,
-    maxConcurrency: 1,
-  },
-  glm: { ...GENERIC_WEB_RATE_LIMIT_DEFAULTS },
-  qwen: { ...GENERIC_WEB_RATE_LIMIT_DEFAULTS },
-  'qwen-ai': { ...GENERIC_WEB_RATE_LIMIT_DEFAULTS },
-  minimax: {
-    requestsPerMinute: 20,
-    minIntervalMs: 1500,
-    maxConcurrency: 1,
-  },
-  mimo: { ...GENERIC_WEB_RATE_LIMIT_DEFAULTS },
-  perplexity: {
-    requestsPerMinute: 12,
-    minIntervalMs: 3000,
-    maxConcurrency: 1,
-  },
-  zai: {
-    requestsPerMinute: 12,
-    minIntervalMs: 2000,
-    maxConcurrency: 1,
-  },
-}
-
-/**
- * Resolve effective limits for an account.
- * - undefined field → provider default (soft, not persisted)
- * - 0 → unlimited for that dimension
+ * Resolve effective HCE limits for an account.
+ * - undefined field → provider default
+ * - 0 → unlimited for that dimension (where applicable)
  */
 export function resolveAccountRateLimits(
   providerId: string,
-  account: {
-    requestsPerMinute?: number
-    minIntervalMs?: number
-    maxConcurrency?: number
-  }
+  account: AccountRateLimitFields,
 ): AccountRateLimitDefaults {
   const base = PROVIDER_RATE_LIMIT_DEFAULTS[providerId] || GENERIC_WEB_RATE_LIMIT_DEFAULTS
 
@@ -78,12 +48,78 @@ export function resolveAccountRateLimits(
     minIntervalMs: account.minIntervalMs === undefined ? base.minIntervalMs : account.minIntervalMs,
     maxConcurrency:
       account.maxConcurrency === undefined ? base.maxConcurrency : account.maxConcurrency,
+    requestsPerHour:
+      account.requestsPerHour === undefined ? base.requestsPerHour : account.requestsPerHour,
+    dailyLimit: account.dailyLimit === undefined ? base.dailyLimit : account.dailyLimit,
+    burstCapacity: account.burstCapacity === undefined ? base.burstCapacity : account.burstCapacity,
+    burstRefillMs: account.burstRefillMs === undefined ? base.burstRefillMs : account.burstRefillMs,
+    stickyTtlMs: account.stickyTtlMs === undefined ? base.stickyTtlMs : account.stickyTtlMs,
+    sessionCreatesPerHour:
+      account.sessionCreatesPerHour === undefined
+        ? base.sessionCreatesPerHour
+        : account.sessionCreatesPerHour,
+    switchPenaltyMs:
+      account.switchPenaltyMs === undefined ? base.switchPenaltyMs : account.switchPenaltyMs,
+    intervalJitterRatio: base.intervalJitterRatio,
+    retryAfterCapMs: base.retryAfterCapMs,
   }
 }
 
 /**
- * Defaults to persist when creating a new account.
+ * Detect pre-HCE loose DeepSeek (or similar) persisted values that should be migrated.
  */
-export function getCreateDefaultsForProvider(providerId: string): AccountRateLimitDefaults {
-  return { ...(PROVIDER_RATE_LIMIT_DEFAULTS[providerId] || GENERIC_WEB_RATE_LIMIT_DEFAULTS) }
+export function shouldMigrateLegacyLooseLimits(
+  providerId: string,
+  account: AccountRateLimitFields,
+): boolean {
+  if (providerId === 'deepseek') {
+    return (
+      account.requestsPerMinute === LEGACY_LOOSE_DEEPSEEK.requestsPerMinute &&
+      account.minIntervalMs === LEGACY_LOOSE_DEEPSEEK.minIntervalMs
+    )
+  }
+  if (
+    typeof account.minIntervalMs === 'number' &&
+    account.minIntervalMs > 0 &&
+    account.minIntervalMs <= 2000 &&
+    typeof account.requestsPerMinute === 'number' &&
+    account.requestsPerMinute >= 20
+  ) {
+    return true
+  }
+  return false
+}
+
+/**
+ * Build persisted HCE field patch for migration / create.
+ */
+export function toPersistedRateLimitPatch(
+  defaults: AccountRateLimitDefaults,
+): Required<
+  Pick<
+    AccountRateLimitFields,
+    | 'requestsPerMinute'
+    | 'minIntervalMs'
+    | 'maxConcurrency'
+    | 'requestsPerHour'
+    | 'dailyLimit'
+    | 'burstCapacity'
+    | 'burstRefillMs'
+    | 'stickyTtlMs'
+    | 'sessionCreatesPerHour'
+    | 'switchPenaltyMs'
+  >
+> {
+  return {
+    requestsPerMinute: defaults.requestsPerMinute,
+    minIntervalMs: defaults.minIntervalMs,
+    maxConcurrency: defaults.maxConcurrency,
+    requestsPerHour: defaults.requestsPerHour,
+    dailyLimit: defaults.dailyLimit,
+    burstCapacity: defaults.burstCapacity,
+    burstRefillMs: defaults.burstRefillMs,
+    stickyTtlMs: defaults.stickyTtlMs,
+    sessionCreatesPerHour: defaults.sessionCreatesPerHour,
+    switchPenaltyMs: defaults.switchPenaltyMs,
+  }
 }

@@ -30,6 +30,7 @@ import {
   Check
 } from 'lucide-react'
 import type { Provider, CredentialField, Account, BuiltinProviderConfig, ProviderVendor } from '@/types/electron'
+import { getCreateDefaultsForProvider } from '../../../../shared/rateLimitDefaults'
 
 /**
  * Map OAuth credentials to provider credential field names
@@ -125,6 +126,7 @@ interface AddAccountDialogProps {
     requestsPerMinute?: number
     minIntervalMs?: number
     maxConcurrency?: number
+    requestsPerHour?: number
   }) => Promise<void>
   onValidateToken: (providerId: string, credentials: Record<string, string>) => Promise<{
     valid: boolean
@@ -154,6 +156,7 @@ export function AddAccountDialog({
   const [name, setName] = useState('')
   const [dailyLimit, setDailyLimit] = useState<string>('')
   const [requestsPerMinute, setRequestsPerMinute] = useState<string>('')
+  const [requestsPerHour, setRequestsPerHour] = useState<string>('')
   const [minIntervalMs, setMinIntervalMs] = useState<string>('')
   const [maxConcurrency, setMaxConcurrency] = useState<string>('')
   const [credentials, setCredentials] = useState<Record<string, string>>({})
@@ -177,12 +180,23 @@ export function AddAccountDialog({
   const credentialFields: CredentialField[] = builtinProvider?.credentialFields || getDefaultCredentialFields(provider?.authType, t)
   const supportsOAuth = provider && ['deepseek', 'glm', 'kimi', 'mimo', 'minimax', 'qwen', 'qwen-ai', 'zai', 'perplexity'].includes(provider.id)
 
+  /** Prefill form fields with provider HCE defaults (same numbers main persists). */
+  const applyProviderHceDefaults = (providerId?: string) => {
+    const defaults = getCreateDefaultsForProvider(providerId || 'deepseek')
+    setDailyLimit(String(defaults.dailyLimit))
+    setRequestsPerMinute(String(defaults.requestsPerMinute))
+    setRequestsPerHour(String(defaults.requestsPerHour))
+    setMinIntervalMs(String(defaults.minIntervalMs))
+    setMaxConcurrency(String(defaults.maxConcurrency))
+  }
+
   useEffect(() => {
     if (open) {
       if (editingAccount) {
         setName(editingAccount.name)
         setDailyLimit(editingAccount.dailyLimit?.toString() || '')
         setRequestsPerMinute(editingAccount.requestsPerMinute?.toString() ?? '')
+        setRequestsPerHour(editingAccount.requestsPerHour?.toString() ?? '')
         setMinIntervalMs(editingAccount.minIntervalMs?.toString() ?? '')
         setMaxConcurrency(editingAccount.maxConcurrency?.toString() ?? '')
         setCredentials(editingAccount.credentials || {})
@@ -191,14 +205,11 @@ export function AddAccountDialog({
         resetForm()
       }
     }
-  }, [open, editingAccount])
+  }, [open, editingAccount, provider?.id])
 
   const resetForm = () => {
     setName('')
-    setDailyLimit('')
-    setRequestsPerMinute('')
-    setMinIntervalMs('')
-    setMaxConcurrency('')
+    applyProviderHceDefaults(provider?.id)
     setCredentials({})
     setValidationResult({})
     setActiveTab('manual')
@@ -292,6 +303,7 @@ export function AddAccountDialog({
         credentials: finalCredentials,
         dailyLimit: parseOptionalNumber(dailyLimit),
         requestsPerMinute: parseOptionalNumber(requestsPerMinute),
+        requestsPerHour: parseOptionalNumber(requestsPerHour),
         minIntervalMs: parseOptionalNumber(minIntervalMs),
         maxConcurrency: parseOptionalNumber(maxConcurrency),
       }
@@ -401,19 +413,9 @@ export function AddAccountDialog({
               <div>
                 <Label>{t('providers.rateLimitSection')}</Label>
                 <p className="text-xs text-muted-foreground mt-1">{t('providers.rateLimitSectionHelp')}</p>
+                <p className="text-xs text-amber-700 dark:text-amber-400 mt-1">{t('providers.hceWarning')}</p>
               </div>
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                <div className="space-y-1">
-                  <Label htmlFor="requestsPerMinute" className="text-xs">{t('providers.requestsPerMinute')}</Label>
-                  <Input
-                    id="requestsPerMinute"
-                    type="number"
-                    min={0}
-                    placeholder={t('providers.requestsPerMinutePlaceholder')}
-                    value={requestsPerMinute}
-                    onChange={(e) => setRequestsPerMinute(e.target.value)}
-                  />
-                </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div className="space-y-1">
                   <Label htmlFor="minIntervalMs" className="text-xs">{t('providers.minIntervalMs')}</Label>
                   <Input
@@ -423,6 +425,28 @@ export function AddAccountDialog({
                     placeholder={t('providers.minIntervalMsPlaceholder')}
                     value={minIntervalMs}
                     onChange={(e) => setMinIntervalMs(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="requestsPerHour" className="text-xs">{t('providers.requestsPerHour')}</Label>
+                  <Input
+                    id="requestsPerHour"
+                    type="number"
+                    min={0}
+                    placeholder={t('providers.requestsPerHourPlaceholder')}
+                    value={requestsPerHour}
+                    onChange={(e) => setRequestsPerHour(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="requestsPerMinute" className="text-xs">{t('providers.requestsPerMinute')}</Label>
+                  <Input
+                    id="requestsPerMinute"
+                    type="number"
+                    min={0}
+                    placeholder={t('providers.requestsPerMinutePlaceholder')}
+                    value={requestsPerMinute}
+                    onChange={(e) => setRequestsPerMinute(e.target.value)}
                   />
                 </div>
                 <div className="space-y-1">

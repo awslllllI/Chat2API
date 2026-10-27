@@ -1,121 +1,103 @@
 /**
- * Lightweight smoke tests for rate-limit gate + upstream error classifier.
+ * HCE account-gate arithmetic smoke (no live upstream).
  * Run: node scripts/test-account-gate.mjs
  */
 
 import assert from 'node:assert/strict'
-import { createRequire } from 'node:module'
+import { register } from 'node:module'
+import { pathToFileURL } from 'node:url'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const root = path.resolve(__dirname, '..')
 
-// Prefer compiled output if present; otherwise skip with message (dev may not have built).
+/** Resolve extensionless relative imports to .ts for Node's native TS loader. */
+register('data:text/javascript,' + encodeURIComponent(`
+  export async function resolve(specifier, context, nextResolve) {
+    if (specifier.startsWith('.') && !/\\.[cm]?[jt]sx?$/.test(specifier)) {
+      try {
+        return await nextResolve(specifier + '.ts', context)
+      } catch {
+        /* fall through */
+      }
+    }
+    return nextResolve(specifier, context)
+  }
+`), { parentURL: import.meta.url })
+
+async function load(rel) {
+  return import(pathToFileURL(path.join(root, rel)).href)
+}
+
 async function main() {
-  const tsxLike = process.argv.includes('--skip-build-check')
-  let accountGate
-  let classifyUpstreamError
-  let isEmptyAssistantContent
-  let resolveAccountRateLimits
+  const { AccountGate } = await load('src/main/proxy/accountGate.ts')
+  const { resolveAccountRateLimits, shouldMigrateLegacyLooseLimits, PROVIDER_RATE_LIMIT_DEFAULTS } =
+    await load('src/main/proxy/rateLimitDefaults.ts')
 
-  try {
-    // Dynamic import of source via electron-vite is heavy; duplicate minimal logic checks inlined below
-    // by spawning ts-node is not available. Instead validate pure JS copies of critical regex behaviour
-    // and gate arithmetic inlined for CI without full Electron build.
-  } catch {
-    /* ignore */
+  const deepseek = resolveAccountRateLimits('deepseek', {})
+  assert.equal(deepseek.minIntervalMs, 30_000)
+  assert.equal(deepseek.requestsPerHour, 24)
+  assert.equal(deepseek.burstCapacity, 5)
+  assert.ok(deepseek.requestsPerMinute <= 6)
+
+  assert.equal(
+    shouldMigrateLegacyLooseLimits('deepseek', { requestsPerMinute: 24, minIntervalMs: 1500 }),
+    true,
+  )
+  assert.equal(
+    shouldMigrateLegacyLooseLimits('deepseek', { requestsPerMinute: 6, minIntervalMs: 30_000 }),
+    false,
+  )
+
+  const gate = new AccountGate()
+  const id = 'acct-hce-1'
+  const limits = { ...PROVIDER_RATE_LIMIT_DEFAULTS.deepseek, intervalJitterRatio: 0 }
+
+  assert.equal(gate.tryAcquire(id, limits), true)
+  gate.release(id, limits)
+
+  const blocked = gate.check(id, limits)
+  assert.equal(blocked.available, false)
+  assert.ok(['interval', 'switch_penalty'].includes(blocked.reason))
+  assert.ok((blocked.retryAfterMs || 0) > 0)
+
+  const burstId = 'acct-burst'
+  const burstLimits = {
+    ...limits,
+    minIntervalMs: 0,
+    requestsPerMinute: 0,
+    requestsPerHour: 0,
+    burstCapacity: 2,
+    burstRefillMs: 60_000,
   }
+  assert.equal(gate.tryAcquire(burstId, burstLimits), true)
+  gate.release(burstId, burstLimits)
+  assert.equal(gate.tryAcquire(burstId, burstLimits), true)
+  gate.release(burstId, burstLimits)
+  assert.equal(gate.tryAcquire(burstId, burstLimits), false)
+  assert.equal(gate.check(burstId, burstLimits).reason, 'burst')
 
-  // --- Inline gate behaviour mirror (keeps script runnable without build) ---
-  class MiniGate {
-    constructor() {
-      this.states = new Map()
-    }
-    getState(id) {
-      if (!this.states.has(id)) this.states.set(id, { window: [], lastDispatchAt: 0, inFlight: 0 })
-      return this.states.get(id)
-    }
-    check(id, limits) {
-      const now = Date.now()
-      const s = this.getState(id)
-      s.window = s.window.filter((t) => t > now - 60_000)
-      if (limits.maxConcurrency > 0 && s.inFlight >= limits.maxConcurrency) {
-        return { available: false, reason: 'concurrency' }
-      }
-      if (limits.minIntervalMs > 0 && s.lastDispatchAt && now - s.lastDispatchAt < limits.minIntervalMs) {
-        return { available: false, reason: 'interval', retryAfterMs: limits.minIntervalMs - (now - s.lastDispatchAt) }
-      }
-      if (limits.requestsPerMinute > 0 && s.window.length >= limits.requestsPerMinute) {
-        return { available: false, reason: 'rpm' }
-      }
-      return { available: true }
-    }
-    tryAcquire(id, limits) {
-      if (!this.check(id, limits).available) return false
-      const s = this.getState(id)
-      const now = Date.now()
-      s.inFlight++
-      s.lastDispatchAt = now
-      if (limits.requestsPerMinute > 0) s.window.push(now)
-      return true
-    }
-    release(id) {
-      const s = this.getState(id)
-      s.inFlight = Math.max(0, s.inFlight - 1)
-    }
-  }
+  const sessId = 'acct-sess'
+  const sessLimits = { ...limits, sessionCreatesPerHour: 2 }
+  assert.equal(gate.checkSessionCreate(sessId, sessLimits).available, true)
+  gate.recordSessionCreate(sessId, sessLimits)
+  gate.recordSessionCreate(sessId, sessLimits)
+  assert.equal(gate.checkSessionCreate(sessId, sessLimits).available, false)
+  assert.equal(gate.checkSessionCreate(sessId, sessLimits).reason, 'session_create')
 
-  const gate = new MiniGate()
-  const limits = { requestsPerMinute: 2, minIntervalMs: 50, maxConcurrency: 1 }
+  const switchId = 'acct-switch'
+  gate.applySwitchPenalty(switchId, { ...limits, switchPenaltyMs: 60_000 })
+  const penalized = gate.check(switchId, { ...limits, minIntervalMs: 0 })
+  assert.equal(penalized.available, false)
 
-  assert.equal(gate.tryAcquire('a1', limits), true)
-  assert.equal(gate.check('a1', limits).available, false, 'concurrency should block')
-  gate.release('a1')
-  // interval still blocks
-  assert.equal(gate.check('a1', limits).reason, 'interval')
-  await new Promise((r) => setTimeout(r, 60))
-  assert.equal(gate.tryAcquire('a1', limits), true)
-  gate.release('a1')
-  await new Promise((r) => setTimeout(r, 60))
-  assert.equal(gate.tryAcquire('a1', limits), false, 'RPM=2 should block third')
+  const retry = gate.estimateRetryAfterMs([id], () => limits)
+  assert.ok(retry >= 1000 && retry <= 60_000)
 
-  // Classifier patterns (mirror)
-  const BAN = [/禁言/, /被限制/, /account.*(banned|restricted)/i]
-  const RATE = [/rate.?limit/i, /请求过于频繁/, /429/]
-  const AUTH = [/unauthorized/i, /invalid.?token/i]
-  function classify(status, message) {
-    const text = (message || '').trim()
-    if (status === 429) return 'rate_limit'
-    if (status === 401) return 'auth'
-    if (BAN.some((p) => p.test(text))) return 'ban_or_mute'
-    if (RATE.some((p) => p.test(text))) return 'rate_limit'
-    if (AUTH.some((p) => p.test(text))) return 'auth'
-    if (status === 403) return 'rate_limit' // ambiguous → not auth
-    return 'other'
-  }
-
-  assert.equal(classify(429, 'x'), 'rate_limit')
-  assert.equal(classify(200, '账号被限制'), 'ban_or_mute')
-  assert.equal(classify(401, 'Unauthorized'), 'auth')
-  assert.equal(classify(403, 'forbidden'), 'rate_limit')
-  assert.equal(classify(500, 'oops'), 'other')
-
-  // Retry-After cap expectation
-  const retryAfter = Math.min(Math.max(Math.ceil(20_000 / 1000), 1), 15)
-  assert.equal(retryAfter, 15)
-
-  console.log('OK: account gate + classifier smoke checks passed')
-  if (tsxLike) console.log('(build check skipped)')
-  void accountGate
-  void classifyUpstreamError
-  void isEmptyAssistantContent
-  void resolveAccountRateLimits
-  void createRequire
-  void root
+  console.log('test-account-gate (HCE): ok')
 }
 
 main().catch((err) => {
-  console.error(err)
+  console.error('test-account-gate: FAIL', err)
   process.exit(1)
 })

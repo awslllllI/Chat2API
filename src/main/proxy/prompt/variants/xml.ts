@@ -23,7 +23,7 @@ When you decide to call a tool, you MUST respond with NOTHING except a single <t
 
 <tool_use>
   <name>exact_tool_name_from_list</name>
-  <arguments>{"argument": "value"}</arguments>
+  <arguments>{"file_path":"/path/to/file","content":"hello"}</arguments>
 </tool_use>
 
 CRITICAL RULES:

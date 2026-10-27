@@ -383,6 +383,7 @@ export function Providers() {
     requestsPerMinute?: number
     minIntervalMs?: number
     maxConcurrency?: number
+    requestsPerHour?: number
   }) => {
     if (!store.selectedProviderId) return
     
@@ -396,6 +397,7 @@ export function Providers() {
         requestsPerMinute: data.requestsPerMinute,
         minIntervalMs: data.minIntervalMs,
         maxConcurrency: data.maxConcurrency,
+        requestsPerHour: data.requestsPerHour,
       })
       store.addAccount(account)
       

@@ -129,7 +129,9 @@ export function addParameter(target: Record<string, unknown>, name: string, valu
 }
 
 export function renderToolList(tools: NormalizedToolDefinition[]): string {
-  return tools
+  const typeRule =
+    'CRITICAL: Argument values must use real JSON types from the schema (array/object/number/boolean/string). NEVER stringify arrays or objects into a string field.'
+  const body = tools
     .map((tool) => {
       const parameters = JSON.stringify(tool.parameters ?? {})
       const required = Array.isArray((tool.parameters as { required?: unknown } | undefined)?.required)
@@ -139,9 +141,27 @@ export function renderToolList(tools: NormalizedToolDefinition[]): string {
         required.length > 0
           ? ` REQUIRED args (must include every one): [${required.join(', ')}].`
           : ''
-      return `Tool \`${tool.name}\`: ${tool.description || 'No description'}.${requiredHint} Arguments JSON schema: ${parameters}`
+      const typeHints = formatPropertyTypeHints(tool.parameters)
+      return `Tool \`${tool.name}\`: ${tool.description || 'No description'}.${requiredHint}${typeHints} Arguments JSON schema: ${parameters}`
     })
     .join('\n')
+  return `${typeRule}\n${body}`
+}
+
+/**
+ * Compact property type list so models see e.g. todos:array explicitly.
+ */
+function formatPropertyTypeHints(parameters: Record<string, unknown> | undefined): string {
+  const props = (parameters as { properties?: Record<string, { type?: string | string[] }> } | undefined)
+    ?.properties
+  if (!props || typeof props !== 'object') return ''
+  const parts = Object.entries(props).map(([name, schema]) => {
+    const t = schema?.type
+    const typeLabel = Array.isArray(t) ? t.join('|') : t || 'any'
+    return `${name}:${typeLabel}`
+  })
+  if (parts.length === 0) return ''
+  return ` Arg types: {${parts.join(', ')}}.`
 }
 
 export function genericToolResultBlock(result: NormalizedToolResult): string {

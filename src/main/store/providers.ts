@@ -155,9 +155,16 @@ export class ProviderManager {
     const updated = storeManager.updateProvider(id, updates)
     
     if (updated) {
-      storeManager.addLog('info', `Update provider: ${existing.name}`, {
-        providerId: id,
-      })
+      // Status polls touch lastStatusCheck often — do not flood the run log.
+      const keys = Object.keys(updates)
+      const statusOnly =
+        keys.length > 0 &&
+        keys.every((key) => key === 'status' || key === 'lastStatusCheck')
+      if (!statusOnly) {
+        storeManager.addLog('info', `Update provider: ${existing.name}`, {
+          providerId: id,
+        })
+      }
     }
     
     return updated

@@ -13,6 +13,12 @@ import { modelMapper } from '../modelMapper'
 import { storeManager } from '../../store/store'
 import { accountGate } from '../accountGate'
 import { resolveAccountRateLimits } from '../rateLimitDefaults'
+import {
+  clientAbortSignal,
+  resolveAdmissionCapMs,
+  selectAccountWithAdmissionWait,
+  tryAcquireWithAdmissionWait,
+} from '../admissionWait'
 import { applyUpstreamFailure, applyEmptySuccessGuard } from '../accountHealth'
 
 const router = new Router({ prefix: '/v1' })
@@ -98,16 +104,41 @@ router.post('/completions', async (ctx: Context) => {
   const config = storeManager.getConfig()
   const preferredProviderId = modelMapper.getPreferredProvider(request.model)
   const preferredAccountId = modelMapper.getPreferredAccount(request.model)
+  const admissionCapMs = resolveAdmissionCapMs(preferredProviderId || 'unknown')
+  const abortSignal = clientAbortSignal(ctx.req)
 
-  const selectResult = loadBalancer.selectAccountDetailed(
-    request.model,
-    config.loadBalanceStrategy,
-    preferredProviderId,
-    preferredAccountId
-  )
+  let selectResult
+  try {
+    selectResult = await selectAccountWithAdmissionWait(
+      request.model,
+      config.loadBalanceStrategy,
+      preferredProviderId,
+      preferredAccountId,
+      admissionCapMs,
+      abortSignal,
+    )
+  } catch (error) {
+    if ((error as { code?: string })?.code === 'CLIENT_ABORTED') {
+      ctx.status = 499
+      ctx.body = { error: { message: 'Client closed request', type: 'aborted', code: 'client_aborted' } }
+      return
+    }
+    throw error
+  }
   const selection = selectResult.selection
 
   if (!selection) {
+    if (selectResult.unavailabilityReason === 'accounts_unavailable') {
+      ctx.status = 503
+      ctx.body = {
+        error: {
+          message: `No usable account for model: ${request.model}. Accounts are paused, in error, or missing. Re-login or resume an account.${selectResult.unavailabilityDetail ? ` (${selectResult.unavailabilityDetail})` : ''}`,
+          type: 'api_error',
+          code: 'accounts_unavailable',
+        },
+      }
+      return
+    }
     const retryAfter = selectResult.retryAfterSeconds || 5
     ctx.status = 429
     ctx.set('Retry-After', String(retryAfter))
@@ -124,11 +155,23 @@ router.post('/completions', async (ctx: Context) => {
 
   const { account, provider, actualModel } = selection
   const rateLimits = resolveAccountRateLimits(provider.id, account)
+  const capMs = resolveAdmissionCapMs(provider.id, account)
 
-  if (!accountGate.tryAcquire(account.id, rateLimits)) {
+  let acquire
+  try {
+    acquire = await tryAcquireWithAdmissionWait(account.id, rateLimits, capMs, abortSignal)
+  } catch (error) {
+    if ((error as { code?: string })?.code === 'CLIENT_ABORTED') {
+      ctx.status = 499
+      ctx.body = { error: { message: 'Client closed request', type: 'aborted', code: 'client_aborted' } }
+      return
+    }
+    throw error
+  }
+  if (!acquire.acquired) {
     const retryAfter = Math.min(
-      Math.max(Math.ceil((rateLimits.minIntervalMs || 1000) / 1000), 1),
-      15
+      Math.max(Math.ceil((acquire.retryAfterMs || rateLimits.minIntervalMs || 5000) / 1000), 1),
+      Math.ceil((rateLimits.retryAfterCapMs || 60_000) / 1000),
     )
     ctx.status = 429
     ctx.set('Retry-After', String(retryAfter))
@@ -249,7 +292,7 @@ router.post('/completions', async (ctx: Context) => {
       },
     }
   } finally {
-    accountGate.release(account.id)
+    accountGate.release(account.id, rateLimits)
   }
 })
 

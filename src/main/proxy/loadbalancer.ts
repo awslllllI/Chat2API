@@ -1,7 +1,6 @@
 /**
  * Proxy Service Module - Load Balancer
- * Implements Round Robin / Fill First / Failover within the same provider (S1).
- * Integrates account gate (RPM / interval / concurrency) and cooling / paused.
+ * Same-provider switching with Human Conversation Envelope + sticky accounts.
  */
 
 import { Account, Provider, LoadBalanceStrategy } from '../store/types'
@@ -20,20 +19,33 @@ interface CoolDownState {
   reason?: string
 }
 
+interface StickyState {
+  accountId: string
+  until: number
+}
+
+/** Client-facing reason when no account can be selected. */
+export type AccountUnavailabilityReason =
+  | 'no_available_account_or_rate_limited'
+  | 'accounts_unavailable'
+
 export interface SelectAccountResult {
   selection: AccountSelection | null
-  /** When selection is null, suggested Retry-After seconds for clients */
+  /** When selection is null, suggested Retry-After seconds for clients (0 = do not retry as rate-limit) */
   retryAfterSeconds: number
   /** Why no account was selected */
-  unavailabilityReason?: string
+  unavailabilityReason?: AccountUnavailabilityReason
+  /** Short status summary for logs/UI (no secrets) */
+  unavailabilityDetail?: string
 }
 
 /**
- * Load Balancer with same-provider switching and rate gates.
+ * Load Balancer with sticky same-provider switching and HCE gates.
  */
 export class LoadBalancer {
-  private roundRobinIndex: Map<string, number> = new Map()
   private coolDowns: Map<string, CoolDownState> = new Map()
+  /** Sticky account per provider */
+  private stickyByProvider: Map<string, StickyState> = new Map()
   private static readonly FAIL_THRESHOLD = 3
   private static readonly RECOVERY_TIME = 60_000
 
@@ -51,6 +63,7 @@ export class LoadBalancer {
       kind: 'failure',
       reason,
     })
+    this.clearStickyIfAccount(accountId)
   }
 
   /**
@@ -66,6 +79,7 @@ export class LoadBalancer {
       kind: 'rate_limit',
       reason,
     })
+    this.clearStickyIfAccount(accountId)
   }
 
   /**
@@ -98,36 +112,51 @@ export class LoadBalancer {
   }
 
   /**
-   * Select account for a model (same-provider multi-account only for a chosen provider set).
+   * Select account for a model (same-provider multi-account only).
    */
   selectAccount(
     model: string,
     strategy: LoadBalanceStrategy = 'round-robin',
     preferredProviderId?: string,
-    preferredAccountId?: string
+    preferredAccountId?: string,
   ): AccountSelection | null {
     return this.selectAccountDetailed(model, strategy, preferredProviderId, preferredAccountId).selection
   }
 
   /**
    * Select account and return retry hints when none available.
+   * Default behaviour is sticky; round-robin is no longer used for healthy rotation.
    */
   selectAccountDetailed(
     model: string,
     strategy: LoadBalanceStrategy = 'round-robin',
     preferredProviderId?: string,
-    preferredAccountId?: string
+    preferredAccountId?: string,
   ): SelectAccountResult {
     const candidates = this.getAvailableAccounts(model, preferredProviderId, strategy === 'failover')
 
     if (candidates.length === 0) {
       const relatedIds = this.collectRelatedAccountIds(model, preferredProviderId)
+      const diagnosis = this.diagnoseUnavailability(relatedIds)
+
+      // Auth/paused/error (or no accounts): do not masquerade as rate-limit with Retry-After storms.
+      if (diagnosis.kind === 'accounts_unavailable') {
+        console.log(
+          `[LoadBalancer] No usable account for model="${model}" provider=${preferredProviderId || '*'} detail=${diagnosis.detail}`,
+        )
+        return {
+          selection: null,
+          retryAfterSeconds: 0,
+          unavailabilityReason: 'accounts_unavailable',
+          unavailabilityDetail: diagnosis.detail,
+        }
+      }
+
       const retryAfterMs = accountGate.estimateRetryAfterMs(relatedIds, (id) => {
         const acc = storeManager.getAccountById(id)
         const providerId = acc?.providerId || preferredProviderId || 'unknown'
         return resolveAccountRateLimits(providerId, acc || {})
       })
-      // Also consider cooling remaining time
       let coolingWait = retryAfterMs
       for (const id of relatedIds) {
         const info = this.getCoolDownInfo(id)
@@ -135,21 +164,40 @@ export class LoadBalancer {
           coolingWait = Math.min(coolingWait, Math.max(info.until - Date.now(), 1000))
         }
       }
-      const retryAfterSeconds = Math.min(Math.max(Math.ceil(Math.min(retryAfterMs, coolingWait) / 1000), 1), 15)
+      const waitMs = Math.min(retryAfterMs, coolingWait)
+      const retryAfterSeconds = Math.min(Math.max(Math.ceil(waitMs / 1000), 1), 60)
       console.log(
-        `[LoadBalancer] No available account for model="${model}" provider=${preferredProviderId || '*'} retryAfter=${retryAfterSeconds}s`
+        `[LoadBalancer] No available account for model="${model}" provider=${preferredProviderId || '*'} retryAfter=${retryAfterSeconds}s detail=${diagnosis.detail}`,
       )
       return {
         selection: null,
         retryAfterSeconds,
         unavailabilityReason: 'no_available_account_or_rate_limited',
+        unavailabilityDetail: diagnosis.detail,
       }
     }
 
     if (preferredAccountId) {
       const preferred = candidates.find((c) => c.account.id === preferredAccountId)
       if (preferred && !this.isAccountCooling(preferredAccountId)) {
+        this.setSticky(preferred.provider.id, preferred.account.id, preferred.provider.id, preferred.account)
         return { selection: preferred, retryAfterSeconds: 0 }
+      }
+    }
+
+    // Sticky: prefer current sticky account while still available
+    const providerId = candidates[0]?.provider.id
+    if (providerId) {
+      const sticky = this.getSticky(providerId)
+      if (sticky) {
+        const stickyCandidate = candidates.find((c) => c.account.id === sticky.accountId)
+        if (stickyCandidate) {
+          console.log(
+            `[LoadBalancer] Sticky account ${stickyCandidate.account.name} (${stickyCandidate.account.id}) provider=${providerId}`,
+          )
+          return { selection: stickyCandidate, retryAfterSeconds: 0 }
+        }
+        this.stickyByProvider.delete(providerId)
       }
     }
 
@@ -159,13 +207,75 @@ export class LoadBalancer {
     } else if (strategy === 'failover') {
       selected = this.selectFailover(candidates)
     } else {
-      selected = this.selectRoundRobin(candidates)
+      // HCE: no healthy round-robin — pick fill-first (least used today)
+      selected = this.selectFillFirst(candidates)
     }
 
+    this.commitSelection(selected)
+
     console.log(
-      `[LoadBalancer] Selected account ${selected.account.name} (${selected.account.id}) provider=${selected.provider.id}`
+      `[LoadBalancer] Selected account ${selected.account.name} (${selected.account.id}) provider=${selected.provider.id}`,
     )
     return { selection: selected, retryAfterSeconds: 0 }
+  }
+
+  /**
+   * After choosing a non-sticky account, set sticky and apply switch penalty if switching.
+   */
+  private commitSelection(selected: AccountSelection): void {
+    const providerId = selected.provider.id
+    const previous = this.stickyByProvider.get(providerId)
+    const limits = resolveAccountRateLimits(providerId, selected.account)
+
+    if (previous && previous.accountId !== selected.account.id) {
+      accountGate.applySwitchPenalty(selected.account.id, limits)
+      console.log(
+        `[LoadBalancer] Switch penalty ${limits.switchPenaltyMs}ms on ${selected.account.id} (was ${previous.accountId})`,
+      )
+    }
+
+    this.setSticky(providerId, selected.account.id, providerId, selected.account)
+  }
+
+  /**
+   * Remember sticky account for a provider.
+   */
+  private setSticky(
+    providerId: string,
+    accountId: string,
+    _providerKey: string,
+    account: Account,
+  ): void {
+    const limits = resolveAccountRateLimits(providerId, account)
+    const ttl = limits.stickyTtlMs > 0 ? limits.stickyTtlMs : 900_000
+    this.stickyByProvider.set(providerId, {
+      accountId,
+      until: Date.now() + ttl,
+    })
+  }
+
+  /**
+   * Read sticky if still valid.
+   */
+  private getSticky(providerId: string): StickyState | null {
+    const sticky = this.stickyByProvider.get(providerId)
+    if (!sticky) return null
+    if (Date.now() >= sticky.until) {
+      this.stickyByProvider.delete(providerId)
+      return null
+    }
+    return sticky
+  }
+
+  /**
+   * Clear sticky binding when the sticky account fails / cools.
+   */
+  private clearStickyIfAccount(accountId: string): void {
+    for (const [providerId, sticky] of this.stickyByProvider.entries()) {
+      if (sticky.accountId === accountId) {
+        this.stickyByProvider.delete(providerId)
+      }
+    }
   }
 
   /**
@@ -185,12 +295,70 @@ export class LoadBalancer {
   }
 
   /**
+   * Distinguish permanent account unavailability (auth/paused/error) from temporary HCE/cooling.
+   */
+  private diagnoseUnavailability(
+    relatedIds: string[],
+  ): { kind: AccountUnavailabilityReason; detail: string } {
+    if (relatedIds.length === 0) {
+      return { kind: 'accounts_unavailable', detail: 'no_accounts_for_model' }
+    }
+
+    let active = 0
+    let paused = 0
+    let error = 0
+    let otherInactive = 0
+    let cooling = 0
+    let gated = 0
+    let daily = 0
+
+    for (const id of relatedIds) {
+      const account = storeManager.getAccountById(id)
+      if (!account) {
+        otherInactive += 1
+        continue
+      }
+      if (account.status !== 'active') {
+        if (account.status === 'paused') paused += 1
+        else if (account.status === 'error') error += 1
+        else otherInactive += 1
+        continue
+      }
+      active += 1
+      if (this.isAccountCooling(id)) {
+        cooling += 1
+        continue
+      }
+      const limits = resolveAccountRateLimits(account.providerId, account)
+      const dailyCap =
+        account.dailyLimit !== undefined && account.dailyLimit > 0
+          ? account.dailyLimit
+          : limits.dailyLimit
+      if (dailyCap > 0 && account.todayUsed && account.todayUsed >= dailyCap) {
+        daily += 1
+        continue
+      }
+      const gate = accountGate.check(id, limits)
+      if (!gate.available) gated += 1
+    }
+
+    const detail = `active=${active} paused=${paused} error=${error} inactive=${otherInactive} cooling=${cooling} gated=${gated} daily=${daily}`
+
+    // No schedulable active accounts left → client should not treat as rate-limit.
+    if (active === 0) {
+      return { kind: 'accounts_unavailable', detail }
+    }
+
+    return { kind: 'no_available_account_or_rate_limited', detail }
+  }
+
+  /**
    * Get available accounts list (gate + status + cooling filtered).
    */
   private getAvailableAccounts(
     model: string,
     preferredProviderId?: string,
-    excludeFailed: boolean = false
+    excludeFailed: boolean = false,
   ): AccountSelection[] {
     const providers = storeManager.getProviders().filter((p) => p.enabled)
     const candidates: AccountSelection[] = []
@@ -210,7 +378,7 @@ export class LoadBalancer {
         .filter((account) => !excludeFailed || !this.isAccountCooling(account.id))
 
       console.log(
-        `[LoadBalancer] Provider ${provider.name} (${provider.id}) has ${accounts.length} available accounts`
+        `[LoadBalancer] Provider ${provider.name} (${provider.id}) has ${accounts.length} available accounts`,
       )
 
       for (const account of accounts) {
@@ -287,15 +455,19 @@ export class LoadBalancer {
       return false
     }
 
-    if (account.dailyLimit && account.todayUsed && account.todayUsed >= account.dailyLimit) {
+    const limits = resolveAccountRateLimits(providerId, account)
+    const dailyCap =
+      account.dailyLimit !== undefined && account.dailyLimit > 0
+        ? account.dailyLimit
+        : limits.dailyLimit
+    if (dailyCap > 0 && account.todayUsed && account.todayUsed >= dailyCap) {
       return false
     }
 
-    const limits = resolveAccountRateLimits(providerId, account)
     const gate = accountGate.check(account.id, limits)
     if (!gate.available) {
       console.log(
-        `[LoadBalancer] Account ${account.id} gated: ${gate.reason} retryAfterMs=${gate.retryAfterMs}`
+        `[LoadBalancer] Account ${account.id} gated: ${gate.reason} retryAfterMs=${gate.retryAfterMs}`,
       )
       return false
     }
@@ -309,7 +481,7 @@ export class LoadBalancer {
   private mapModel(model: string, provider: Provider): string {
     const effectiveModels = storeManager.getEffectiveModels(provider.id)
     const effectiveModel = effectiveModels.find(
-      (m) => m.displayName.toLowerCase() === model.toLowerCase()
+      (m) => m.displayName.toLowerCase() === model.toLowerCase(),
     )
 
     if (effectiveModel) {
@@ -322,7 +494,7 @@ export class LoadBalancer {
     if (mapping && (!mapping.preferredProviderId || mapping.preferredProviderId === provider.id)) {
       const actualModel = mapping.actualModel
       const actualEffectiveModel = effectiveModels.find(
-        (m) => m.displayName.toLowerCase() === actualModel.toLowerCase()
+        (m) => m.displayName.toLowerCase() === actualModel.toLowerCase(),
       )
       if (actualEffectiveModel) {
         return actualEffectiveModel.actualModelId
@@ -334,22 +506,7 @@ export class LoadBalancer {
   }
 
   /**
-   * Round Robin within candidate set (typically same provider when model maps to one).
-   */
-  private selectRoundRobin(candidates: AccountSelection[]): AccountSelection {
-    const providerIds = [...new Set(candidates.map((c) => c.provider.id))]
-    const key = providerIds.join(',')
-
-    const currentIndex = this.roundRobinIndex.get(key) || 0
-    const selected = candidates[currentIndex % candidates.length]
-
-    this.roundRobinIndex.set(key, (currentIndex + 1) % candidates.length)
-
-    return selected
-  }
-
-  /**
-   * Fill First: prefer least-used today.
+   * Fill First: prefer least-used today (sticky-friendly stable pick).
    */
   private selectFillFirst(candidates: AccountSelection[]): AccountSelection {
     return candidates.reduce((best, current) => {
@@ -374,13 +531,13 @@ export class LoadBalancer {
   }
 
   /**
-   * Failover: prefer non-cooling accounts.
+   * Failover: prefer non-cooling accounts, then fill-first.
    */
   private selectFailover(candidates: AccountSelection[]): AccountSelection {
     const healthyCandidates = candidates.filter((c) => !this.isAccountCooling(c.account.id))
 
     if (healthyCandidates.length > 0) {
-      return this.selectRoundRobin(healthyCandidates)
+      return this.selectFillFirst(healthyCandidates)
     }
 
     const sortedCandidates = [...candidates].sort((a, b) => {
@@ -404,10 +561,10 @@ export class LoadBalancer {
   }
 
   /**
-   * Reset Round Robin index.
+   * Reset sticky state (tests / manual).
    */
   resetRoundRobinIndex(): void {
-    this.roundRobinIndex.clear()
+    this.stickyByProvider.clear()
   }
 
   /**

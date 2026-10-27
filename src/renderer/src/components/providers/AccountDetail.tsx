@@ -397,6 +397,23 @@ export function AccountDetail({
                 )}
               </div>
             )}
+
+            <div className="mt-4 rounded-md border p-3 space-y-1 text-xs text-muted-foreground">
+              <p className="font-medium text-foreground">{t('providers.rateLimitSection')}</p>
+              <p>
+                {t('providers.minIntervalMs')}:{' '}
+                {account.minIntervalMs !== undefined ? `${account.minIntervalMs}ms` : '—'}
+              </p>
+              <p>
+                {t('providers.requestsPerHour')}:{' '}
+                {account.requestsPerHour !== undefined ? account.requestsPerHour : '—'}
+              </p>
+              <p>
+                {t('providers.requestsPerMinute')}:{' '}
+                {account.requestsPerMinute !== undefined ? account.requestsPerMinute : '—'}
+              </p>
+              <p className="text-amber-700 dark:text-amber-400 pt-1">{t('providers.hceWarning')}</p>
+            </div>
           </CardContent>
         </Card>
       </div>

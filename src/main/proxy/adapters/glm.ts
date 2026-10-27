@@ -12,7 +12,7 @@ import { createParser } from 'eventsource-parser'
 import FormData from 'form-data'
 import mime from 'mime-types'
 import path from 'path'
-import { toolsToSystemPrompt, TOOL_WRAP_HINT, hasToolPromptInjected } from '../utils/tools'
+import { toolsToSystemPrompt, hasToolPromptInjected } from '../utils/tools'
 import { parseToolCallsFromText } from '../utils/toolParser'
 import { 
   createBaseChunk,
@@ -23,6 +23,52 @@ import type { ToolCallingPlan } from '../toolCalling/types'
 
 const GLM_API_BASE = 'https://chatglm.cn/chatglm'
 const DEFAULT_ASSISTANT_ID = '65940acff94777010aa6b796'
+
+/**
+ * True if text looks like managed tool markup (Chat2API / bracket / DSML).
+ */
+function looksLikeManagedToolMarkup(text: string): boolean {
+  const s = text.trimStart()
+  return (
+    s.includes('<|CHAT2API|') ||
+    s.includes('|CHAT2API|') ||
+    s.includes('[function_calls]') ||
+    s.includes('[call:') ||
+    s.includes('DSML')
+  )
+}
+
+/**
+ * Streaming-safe GLM markup normalize (character fixes only).
+ * Never invent closing tags mid-stream — that truncates args and leaks leftovers as text.
+ */
+function normalizeGlmToolMarkup(text: string): string {
+  if (!text) return text
+  return text
+    .replace(/<\/<\|CHAT2API\|/g, '</|CHAT2API|')
+    .replace(/<\/<\/+/g, '')
+    .replace(/<\/\|CHAT2API\|parameter(?!>)/g, '</|CHAT2API|parameter>')
+}
+
+/**
+ * End-of-stream / non-stream finalize: normalize then close dangling invoke/parameter tags.
+ */
+function finalizeGlmToolMarkup(text: string): string {
+  if (!text) return text
+  let out = normalizeGlmToolMarkup(text)
+  const hasInvoke = /<\|CHAT2API\|invoke\b/i.test(out) || /(?<!<)\|CHAT2API\|invoke\b/i.test(out)
+  const hasClose = /<\/\|CHAT2API\|invoke>/i.test(out)
+  if (hasInvoke && !hasClose && /(?:<\|CHAT2API\||\|CHAT2API\|)parameter\b/i.test(out)) {
+    if (!/<\/\|CHAT2API\|parameter>\s*$/i.test(out) && /(?:<\|CHAT2API\||\|CHAT2API\|)parameter\b[^>]*>[\s\S]*$/i.test(out)) {
+      out += '</|CHAT2API|parameter>'
+    }
+    out += '</|CHAT2API|invoke>'
+  }
+  if (/<\|CHAT2API\|tool_calls>/i.test(out) && !/<\/\|CHAT2API\|tool_calls>/i.test(out)) {
+    out += '</|CHAT2API|tool_calls>'
+  }
+  return out
+}
 const SIGN_SECRET = '8a1317a7468aa3ad86e997d08f3f31cb'
 const ACCESS_TOKEN_EXPIRES = 3600
 const FILE_MAX_SIZE = 100 * 1024 * 1024 // 100MB
@@ -424,34 +470,13 @@ export class GLMAdapter {
     // Clone messages to avoid modifying original request
     const messages = [...request.messages]
 
-    // Check if tool prompt has already been injected by client
-    const toolPromptExists = hasToolPromptInjected(messages)
-
-    // Inject tools definition into prompt if tools are provided and not already injected
+    // Managed tool calling is injected upstream by ToolCallingEngine (Chat2API XML).
+    // Do NOT also inject legacy [function_calls] here — dual formats make GLM emit
+    // unparsable / half-stripped markup that clients render as garbled prose.
     let toolsPrompt = ''
-    if (request.tools && request.tools.length > 0 && !toolPromptExists) {
-      const glmStrictHint = `
-
-GLM STRICT RULES:
-- If user asks to create/modify code or files, you MUST call tools instead of replying with plain text.
-- You MUST output ONLY one [function_calls] block when calling tools.
-- Use exact tool names from list, case-sensitive, do not rename.`
-      toolsPrompt = toolsToSystemPrompt(request.tools) + glmStrictHint
-
-      for (let i = messages.length - 1; i >= 0; i--) {
-        if (messages[i].role === 'user') {
-          const currentContent = messages[i].content
-          if (typeof currentContent === 'string') {
-            messages[i] = { ...messages[i], content: currentContent + TOOL_WRAP_HINT }
-          } else if (Array.isArray(currentContent)) {
-            messages[i] = {
-              ...messages[i],
-              content: [...currentContent, { type: 'text', text: TOOL_WRAP_HINT }],
-            }
-          }
-          break
-        }
-      }
+    if (request.tools && request.tools.length > 0 && !hasToolPromptInjected(messages)) {
+      // Legacy/disabled-engine path only: keep bracket prompt for old clients.
+      toolsPrompt = toolsToSystemPrompt(request.tools)
     }
 
     // Extract and upload files
@@ -838,26 +863,50 @@ export class GLMStreamHandler {
             if (chunk) {
               sentContent += chunk
             }
-            
+
             // Process tool call interception with shared parser buffering.
+            // Never fall back to raw content when a managed plan exists — GLM frequently
+            // emits corrupt Chat2API that must be buffered/suppressed, not leaked.
             const baseChunk = createBaseChunk(this.conversationId, this.model, this.created)
-            const outputChunks = this.toolStreamParser?.push(chunk, baseChunk, !sentRole) ?? (
-              chunk ? [{
+            let outputChunks: any[] = []
+            if (this.toolStreamParser) {
+              // Normalize only — do not auto-close tags until flush.
+              outputChunks = this.toolStreamParser.push(
+                normalizeGlmToolMarkup(chunk),
+                baseChunk,
+                !sentRole,
+              )
+            } else if (chunk && !looksLikeManagedToolMarkup(chunk)) {
+              outputChunks = [{
                 ...baseChunk,
-                choices: [{ index: 0, delta: { ...(!sentRole ? { role: 'assistant' } : {}), content: chunk }, finish_reason: null }],
-              }] : []
-            )
+                choices: [{
+                  index: 0,
+                  delta: { ...(!sentRole ? { role: 'assistant' } : {}), content: chunk },
+                  finish_reason: null,
+                }],
+              }]
+            }
 
             for (const outChunk of outputChunks) {
+              // Final belt: never forward raw protocol markup as assistant content.
+              const deltaContent = outChunk?.choices?.[0]?.delta?.content
+              if (typeof deltaContent === 'string' && looksLikeManagedToolMarkup(deltaContent)) {
+                continue
+              }
               transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
             }
 
             if (outputChunks.length > 0) sentRole = true
           } else {
-            // Flush any remaining tool call buffer before finishing
+            // Finalize dangling Chat2API tags, then flush tool buffer before finishing.
             const baseChunk = createBaseChunk(this.conversationId, this.model, this.created)
-            const flushChunks = this.toolStreamParser?.flush(baseChunk) ?? []
+            const flushChunks =
+              this.toolStreamParser?.flush(baseChunk, finalizeGlmToolMarkup) ?? []
             for (const outChunk of flushChunks) {
+              const deltaContent = outChunk?.choices?.[0]?.delta?.content
+              if (typeof deltaContent === 'string' && looksLikeManagedToolMarkup(deltaContent)) {
+                continue
+              }
               transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
             }
 
@@ -900,8 +949,13 @@ export class GLMStreamHandler {
       console.error('[GLM] Stream error:', err.message)
       // Flush any remaining tool call buffer
       const baseChunk = createBaseChunk(this.conversationId, this.model, this.created)
-      const flushChunks = this.toolStreamParser?.flush(baseChunk) ?? []
+      const flushChunks =
+        this.toolStreamParser?.flush(baseChunk, finalizeGlmToolMarkup) ?? []
       for (const outChunk of flushChunks) {
+        const deltaContent = outChunk?.choices?.[0]?.delta?.content
+        if (typeof deltaContent === 'string' && looksLikeManagedToolMarkup(deltaContent)) {
+          continue
+        }
         transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
       }
       const finishReason = this.toolStreamParser?.hasEmittedToolCall() ? 'tool_calls' : 'stop'
@@ -924,8 +978,13 @@ export class GLMStreamHandler {
       // Only send finish if we haven't already
       if (!transStream.closed) {
         const baseChunk = createBaseChunk(this.conversationId, this.model, this.created)
-        const flushChunks = this.toolStreamParser?.flush(baseChunk) ?? []
+        const flushChunks =
+          this.toolStreamParser?.flush(baseChunk, finalizeGlmToolMarkup) ?? []
         for (const outChunk of flushChunks) {
+          const deltaContent = outChunk?.choices?.[0]?.delta?.content
+          if (typeof deltaContent === 'string' && looksLikeManagedToolMarkup(deltaContent)) {
+            continue
+          }
           transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
         }
         const finishReason = this.toolStreamParser?.hasEmittedToolCall() ? 'tool_calls' : 'stop'
@@ -1035,9 +1094,12 @@ export class GLMStreamHandler {
                 if (partReasoning) fullReasoning += (fullReasoning.length > 0 ? '\n' : '') + partReasoning
               })
 
-              const { content: cleanContent, toolCalls } = this.toolCallingPlan?.shouldParseResponse
-                ? { content: fullText, toolCalls: [] }
-                : parseToolCallsFromText(fullText, 'glm')
+              // Finalize dangling tags once for the full response, then let
+              // ToolCallingEngine.applyNonStreamResponse parse managed markup.
+              const repairedText = finalizeGlmToolMarkup(fullText)
+              const legacy = this.toolCallingPlan?.shouldParseResponse
+                ? { content: repairedText, toolCalls: [] as any[] }
+                : parseToolCallsFromText(repairedText, 'glm')
 
               resolve({
                 id: this.conversationId,
@@ -1048,11 +1110,11 @@ export class GLMStreamHandler {
                     index: 0,
                     message: {
                       role: 'assistant',
-                      content: toolCalls.length > 0 ? null : cleanContent.trim(),
+                      content: legacy.toolCalls.length > 0 ? null : (legacy.content || repairedText).trim(),
                       reasoning_content: fullReasoning || null,
-                      ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {})
+                      ...(legacy.toolCalls.length > 0 ? { tool_calls: legacy.toolCalls } : {})
                     },
-                    finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
+                    finish_reason: legacy.toolCalls.length > 0 ? 'tool_calls' : 'stop',
                   },
                 ],
                 usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },

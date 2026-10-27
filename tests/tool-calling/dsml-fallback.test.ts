@@ -157,3 +157,56 @@ test('malformed Chat2API stream junk is suppressed instead of leaked', () => {
   }
   assert.deepEqual(parser.flush(baseChunk), [])
 })
+
+test('streaming does not emit empty {} before invoke parameters arrive', () => {
+  const parser = new ToolStreamParser(plan('managed_xml'))
+  const open = parser.push(
+    '<|CHAT2API|tool_calls><|CHAT2API|invoke name="pwsh">',
+    baseChunk,
+  )
+  assert.deepEqual(open, [])
+  assert.equal(parser.isBuffering(), true)
+  assert.equal(parser.hasEmittedToolCall(), false)
+
+  const mid = parser.push(
+    '<|CHAT2API|parameter name="command"><![CDATA[Get-Date]]></|CHAT2API|parameter>',
+    baseChunk,
+  )
+  assert.deepEqual(mid, [])
+  assert.equal(parser.hasEmittedToolCall(), false)
+
+  const done = parser.push(
+    '<|CHAT2API|parameter name="description"><![CDATA[show time]]></|CHAT2API|parameter></|CHAT2API|invoke></|CHAT2API|tool_calls>',
+    baseChunk,
+  )
+  assert.equal(done.length, 1)
+  const args = JSON.parse(done[0].choices[0].delta.tool_calls[0].function.arguments)
+  assert.equal(args.command, 'Get-Date')
+  assert.ok(args.description)
+})
+
+test('incomplete standalone invoke is not treated as empty tool call', () => {
+  const result = managedXmlProtocol.parse(
+    '<|CHAT2API|invoke name="pwsh">',
+    { tools, protocol: 'managed_xml' },
+  )
+  assert.equal(result.toolCalls.length, 0)
+})
+
+test('corrupted GLM double-name invoke still resolves real tool name and args', () => {
+  const content =
+    '<|CHAT2API|tool_calls><|CHAT2API|invoke name="mmandoke name="pwsh"><|CHAT2API|parameter name="command"><![CDATA[Get-Date]]></|CHAT2API|parameter><|CHAT2API|parameter name="description"><![CDATA[now]]></|CHAT2API|parameter></|CHAT2API|invoke></|CHAT2API|tool_calls>'
+  const result = managedXmlProtocol.parse(content, { tools, protocol: 'managed_xml' })
+  assert.equal(result.toolCalls.length, 1)
+  assert.equal(result.toolCalls[0].function.name, 'pwsh')
+  const args = JSON.parse(result.toolCalls[0].function.arguments)
+  assert.equal(args.command, 'Get-Date')
+})
+
+test('XML plan falls back to bracket function_calls blocks', () => {
+  const content =
+    '[function_calls]\n[call:pwsh]{"command":"Get-Date","description":"now"}[/call]\n[/function_calls]'
+  const result = parseToolContentWithFallback(content, plan('managed_xml'))
+  assert.equal(result.toolCalls.length, 1)
+  assert.equal(result.toolCalls[0].function.name, 'pwsh')
+})

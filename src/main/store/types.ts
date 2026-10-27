@@ -116,12 +116,24 @@ export interface Account {
   dailyLimit?: number
   /** Today used count */
   todayUsed?: number
-  /** Sliding-window RPM; undefined = soft provider default; 0 = unlimited */
+  /** Sliding-window RPM spike fuse; undefined = soft provider default; 0 = unlimited */
   requestsPerMinute?: number
-  /** Min ms between upstream dispatches; undefined = soft default; 0 = unlimited */
+  /** Min ms after turn end before next dispatch; undefined = soft default; 0 = unlimited */
   minIntervalMs?: number
   /** Max in-flight requests; undefined = soft default; 0 = unlimited */
   maxConcurrency?: number
+  /** Rolling-hour turn cap; undefined = soft default; 0 = unlimited */
+  requestsPerHour?: number
+  /** Burst bucket capacity; undefined = soft default; 0 = disable */
+  burstCapacity?: number
+  /** Ms to refill one burst token */
+  burstRefillMs?: number
+  /** Sticky account TTL ms for this provider */
+  stickyTtlMs?: number
+  /** Max new web sessions per rolling hour */
+  sessionCreatesPerHour?: number
+  /** Switch-away penalty ms for newly selected account */
+  switchPenaltyMs?: number
   /** Last status reason (paused/error), user-visible, no secrets */
   statusReason?: string
 }

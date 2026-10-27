@@ -74,6 +74,13 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
     updaterManager.initialize(mainWindow)
   }
 
+  // One-shot: rewrite known-legacy loose RPM defaults to Human Conversation Envelope
+  try {
+    AccountManager.migrateLegacyRateLimitsToHce()
+  } catch (error) {
+    console.warn('[App] HCE rate-limit migration skipped:', error)
+  }
+
   // Check if auto-start proxy is needed
   const config = storeManager.getConfig()
   if (config.autoStartProxy) {
@@ -564,6 +571,12 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
     requestsPerMinute?: number
     minIntervalMs?: number
     maxConcurrency?: number
+    requestsPerHour?: number
+    burstCapacity?: number
+    burstRefillMs?: number
+    stickyTtlMs?: number
+    sessionCreatesPerHour?: number
+    switchPenaltyMs?: number
   }): Promise<Account> => {
     return AccountManager.create(data)
   })

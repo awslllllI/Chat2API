@@ -11,6 +11,8 @@ import { getDeepSeekHash } from '../../lib/challenge'
 import type { Account, Provider } from '../../store/types'
 import { resolveDeepSeekChatOptions } from './providerModelOptions'
 import { getProviderToolProfile } from '../toolCalling/providerProfiles'
+import { accountGate } from '../accountGate'
+import { resolveAccountRateLimits } from '../rateLimitDefaults'
 
 const DEEPSEEK_API_BASE = 'https://chat.deepseek.com/api'
 
@@ -165,11 +167,24 @@ export class DeepSeekAdapter {
     return accessToken
   }
 
+  /**
+   * Create or reuse a DeepSeek web chat session.
+   * New session creates are HCE-throttled (sessionCreatesPerHour).
+   */
   private async createSession(): Promise<string> {
     const cacheKey = this.account.id
     const cached = sessionCache.get(cacheKey)
     if (cached && Date.now() - cached.createdAt < 300000) {
       return cached.sessionId
+    }
+
+    const limits = resolveAccountRateLimits('deepseek', this.account)
+    const sessionGate = accountGate.checkSessionCreate(this.account.id, limits)
+    if (!sessionGate.available) {
+      const waitSec = Math.ceil((sessionGate.retryAfterMs || 60_000) / 1000)
+      throw new Error(
+        `DeepSeek session create throttled (human envelope). Retry after ~${waitSec}s.`,
+      )
     }
 
     const token = await this.acquireToken()
@@ -197,6 +212,7 @@ export class DeepSeekAdapter {
 
     const sessionId = bizData?.chat_session?.id
     sessionCache.set(cacheKey, { sessionId, createdAt: Date.now() })
+    accountGate.recordSessionCreate(this.account.id, limits)
 
     return sessionId
   }

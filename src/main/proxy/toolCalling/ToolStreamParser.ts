@@ -86,8 +86,12 @@ export class ToolStreamParser {
 
   /**
    * Flush remaining buffer at stream end.
+   * Optional transform runs once on the full buffer (e.g. GLM dangling-tag finalize).
    */
-  flush(baseChunk: any): any[] {
+  flush(baseChunk: any, transform?: (buffered: string) => string): any[] {
+    if (transform && this.buffer) {
+      this.buffer = transform(this.buffer)
+    }
     if (!this.buffer) return []
 
     const parsed = parseToolContentWithFallback(this.buffer, this.plan)

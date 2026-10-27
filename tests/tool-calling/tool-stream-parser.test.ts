@@ -48,13 +48,12 @@ test('bracket marker split across chunks emits a tool call', () => {
   assert.equal(chunks.at(-1)?.choices[0].delta.tool_calls[0].function.name, 'default_api:read_file')
 })
 
-test('bracket output is text when XML protocol is selected', () => {
+test('bracket output falls back to tool_calls when XML protocol is selected', () => {
   const parser = new ToolStreamParser(plan('managed_xml'))
   const text = '[function_calls][call:default_api:read_file]{"filePath":"/tmp/a"}[/call][/function_calls]'
   const chunks = parser.push(text, baseChunk)
 
-  assert.equal(chunks.length, 1)
-  assert.equal(chunks[0].choices[0].delta.content, text)
+  assert.equal(chunks.at(-1)?.choices[0].delta.tool_calls[0].function.name, 'default_api:read_file')
 })
 
 test('XML marker split across chunks emits a tool call', () => {

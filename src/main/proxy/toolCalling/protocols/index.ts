@@ -37,11 +37,19 @@ export function getManagedProtocols(): ToolProtocolAdapter[] {
 
 /**
  * Protocols whose start markers should be watched during streaming.
+ * Prefer primary, then watch DSML + the alternate managed text format.
  */
 export function getStreamWatchProtocols(preferred: ToolProtocolId): ToolProtocolAdapter[] {
   const primary = getToolProtocol(preferred)
   if (preferred === 'deepseek_dsml') return [primary]
-  return [primary, deepseekDsmlProtocol]
+
+  const watchers = [primary, deepseekDsmlProtocol]
+  if (preferred === 'managed_xml' || preferred === 'openai_chat') {
+    watchers.push(managedBracketProtocol)
+  } else if (preferred === 'managed_bracket') {
+    watchers.push(managedXmlProtocol)
+  }
+  return watchers
 }
 
 export { deepseekDsmlProtocol }

@@ -15,6 +15,7 @@ export const DEFAULT_VARIANT: PromptVariant = {
 You can invoke the following developer tools. Call a tool only when it is required and follow the JSON schema exactly when providing arguments.
 
 CRITICAL: Tool names are CASE-SENSITIVE. You MUST use the exact tool name as defined below, including any prefixes like 'default_api:'.
+CRITICAL: Use real JSON types. If a field is type array, pass a JSON array (e.g. "todos":[...]), NEVER a stringified array/object.
 
 {{TOOL_DEFINITIONS}}
 
@@ -22,7 +23,7 @@ CRITICAL: Tool names are CASE-SENSITIVE. You MUST use the exact tool name as def
 When you decide to call a tool, you MUST respond with NOTHING except a single [function_calls] block exactly like the template below:
 
 [function_calls]
-[call:exact_tool_name_from_list]{"argument": "value"}[/call]
+[call:exact_tool_name_from_list]{"file_path":"/path/to/file","content":"hello"}[/call]
 [/function_calls]
 
 CRITICAL RULES:

@@ -151,7 +151,7 @@ test('forced function choice narrows allowed tool names to the selected function
   assert.deepEqual(result.plan.tools.map((tool) => tool.name), ['default_api:list_dir'])
 })
 
-test('non-stream parsing only accepts the selected provider protocol', () => {
+test('non-stream parsing falls back from managed_xml to bracket function_calls', () => {
   const engine = new ToolCallingEngine()
   const transformed = engine.transformRequest({
     request: request(),
@@ -170,6 +170,6 @@ test('non-stream parsing only accepts the selected provider protocol', () => {
 
   engine.applyNonStreamResponse(result, transformed.plan)
 
-  assert.equal(result.choices[0].message.tool_calls, undefined)
-  assert.equal(result.choices[0].message.content, '[function_calls][call:default_api:read_file]{"filePath":"/tmp/a"}[/call][/function_calls]')
+  assert.equal(result.choices[0].finish_reason, 'tool_calls')
+  assert.equal(result.choices[0].message.tool_calls[0].function.name, 'default_api:read_file')
 })

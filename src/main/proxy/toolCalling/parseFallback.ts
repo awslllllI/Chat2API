@@ -1,16 +1,20 @@
 /**
- * Try preferred protocol first, then DeepSeek DSML as a silent fallback parser.
- * Does not cross-parse bracket when XML is selected (preserves protocol selection tests).
+ * Try preferred protocol first, then silent fallbacks (DSML / bracket / XML).
+ * Models often mix formats when prompts historically taught [function_calls]
+ * while the runtime prefers Chat2API XML (especially GLM).
  */
 
-import type { ToolCallingPlan, ToolParseResult } from './types.ts'
+import type { ToolCallingPlan, ToolParseResult, ToolProtocolId } from './types.ts'
 import { getToolProtocol } from './protocols/index.ts'
 import { deepseekDsmlProtocol } from './protocols/deepseekDsml.ts'
+import { managedBracketProtocol } from './protocols/managedBracket.ts'
+import { managedXmlProtocol } from './protocols/managedXml.ts'
 import { sanitizeAssistantText } from './textCleanup.ts'
 import { enforceRequiredToolArguments } from './argumentGuard.ts'
+import type { ToolProtocolAdapter } from './protocols/base.ts'
 
 /**
- * Parse assistant content for tool calls with DSML fallback.
+ * Parse assistant content for tool calls with multi-protocol fallback.
  */
 export function parseToolContentWithFallback(
   content: string,
@@ -22,16 +26,15 @@ export function parseToolContentWithFallback(
     return decorateToolCalls(preferred, plan)
   }
 
-  // Only fall back to DSML when preferred protocol found nothing usable.
-  if (plan.protocol !== 'deepseek_dsml') {
-    const dsml = deepseekDsmlProtocol.parse(content, { ...context, protocol: 'deepseek_dsml' })
-    if (dsml.toolCalls.length > 0) {
-      return decorateToolCalls(dsml, plan)
+  for (const protocol of fallbackProtocols(plan.protocol)) {
+    const parsed = protocol.parse(content, { ...context, protocol: protocol.id })
+    if (parsed.toolCalls.length > 0) {
+      return decorateToolCalls(parsed, plan)
     }
-    if (dsml.rawMatches.length > 0 || dsml.invalidToolNames.length > 0) {
+    if (parsed.rawMatches.length > 0 || parsed.invalidToolNames.length > 0) {
       return {
-        ...dsml,
-        content: sanitizeAssistantText(dsml.content || content),
+        ...parsed,
+        content: sanitizeAssistantText(parsed.content || content),
       }
     }
   }
@@ -40,6 +43,18 @@ export function parseToolContentWithFallback(
     ...preferred,
     content: sanitizeAssistantText(preferred.content || content),
   }
+}
+
+/**
+ * Fallback order after preferred protocol fails to produce tool calls.
+ */
+function fallbackProtocols(preferred: ToolProtocolId): ToolProtocolAdapter[] {
+  const all: ToolProtocolAdapter[] = [
+    deepseekDsmlProtocol,
+    managedXmlProtocol,
+    managedBracketProtocol,
+  ]
+  return all.filter((protocol) => protocol.id !== preferred)
 }
 
 /**

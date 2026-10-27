@@ -6,13 +6,40 @@
 import { storeManager } from './store'
 import { Account, AccountStatus, ValidationResult } from './types'
 import { validateCredentials } from './validator'
-import { getCreateDefaultsForProvider } from '../proxy/rateLimitDefaults'
+import {
+  getCreateDefaultsForProvider,
+  shouldMigrateLegacyLooseLimits,
+  toPersistedRateLimitPatch,
+} from '../proxy/rateLimitDefaults'
 
 /**
  * Account Manager class
  * Provides all operations related to accounts
  */
 export class AccountManager {
+  /**
+   * Migrate pre-HCE loose rate limits to Human Conversation Envelope defaults.
+   * Safe to call on every startup; only rewrites known-legacy profiles.
+   */
+  static migrateLegacyRateLimitsToHce(): number {
+    const accounts = storeManager.getAccounts(false)
+    let migrated = 0
+    for (const account of accounts) {
+      if (!shouldMigrateLegacyLooseLimits(account.providerId, account)) continue
+      const defaults = getCreateDefaultsForProvider(account.providerId)
+      storeManager.updateAccount(account.id, toPersistedRateLimitPatch(defaults))
+      migrated += 1
+      storeManager.addLog('info', `Migrated account rate limits to HCE: ${account.name}`, {
+        accountId: account.id,
+        providerId: account.providerId,
+      })
+    }
+    if (migrated > 0) {
+      console.log(`[Accounts] Migrated ${migrated} account(s) from legacy loose limits to HCE`)
+    }
+    return migrated
+  }
+
   /**
    * Get all accounts
    * @param includeCredentials Whether to include credentials (sensitive data)
@@ -61,6 +88,12 @@ export class AccountManager {
     requestsPerMinute?: number
     minIntervalMs?: number
     maxConcurrency?: number
+    requestsPerHour?: number
+    burstCapacity?: number
+    burstRefillMs?: number
+    stickyTtlMs?: number
+    sessionCreatesPerHour?: number
+    switchPenaltyMs?: number
   }): Account {
     // Ensure provider exists before creating account
     storeManager.ensureProviderExists(data.providerId)
@@ -85,12 +118,25 @@ export class AccountManager {
       updatedAt: now,
       requestCount: 0,
       todayUsed: 0,
-      dailyLimit: data.dailyLimit,
+      dailyLimit: data.dailyLimit !== undefined ? data.dailyLimit : rateDefaults.dailyLimit,
       requestsPerMinute:
         data.requestsPerMinute !== undefined ? data.requestsPerMinute : rateDefaults.requestsPerMinute,
       minIntervalMs: data.minIntervalMs !== undefined ? data.minIntervalMs : rateDefaults.minIntervalMs,
       maxConcurrency:
         data.maxConcurrency !== undefined ? data.maxConcurrency : rateDefaults.maxConcurrency,
+      requestsPerHour:
+        data.requestsPerHour !== undefined ? data.requestsPerHour : rateDefaults.requestsPerHour,
+      burstCapacity:
+        data.burstCapacity !== undefined ? data.burstCapacity : rateDefaults.burstCapacity,
+      burstRefillMs:
+        data.burstRefillMs !== undefined ? data.burstRefillMs : rateDefaults.burstRefillMs,
+      stickyTtlMs: data.stickyTtlMs !== undefined ? data.stickyTtlMs : rateDefaults.stickyTtlMs,
+      sessionCreatesPerHour:
+        data.sessionCreatesPerHour !== undefined
+          ? data.sessionCreatesPerHour
+          : rateDefaults.sessionCreatesPerHour,
+      switchPenaltyMs:
+        data.switchPenaltyMs !== undefined ? data.switchPenaltyMs : rateDefaults.switchPenaltyMs,
       lastStatusCheck: now,
       lastUsed: now,
     }
