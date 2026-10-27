@@ -1,5 +1,10 @@
 import type { ToolCallingPlan } from './types.ts'
-import { getToolProtocol } from './protocols/index.ts'
+import { getStreamWatchProtocols } from './protocols/index.ts'
+import { parseToolContentWithFallback } from './parseFallback.ts'
+import {
+  looksLikeToolProtocolPrefix,
+  sanitizeAssistantText,
+} from './textCleanup.ts'
 
 export class ToolStreamParser {
   private readonly plan: ToolCallingPlan
@@ -12,6 +17,9 @@ export class ToolStreamParser {
     this.plan = plan
   }
 
+  /**
+   * Feed a content delta; emit text and/or tool_call chunks.
+   */
   push(content: string, baseChunk: any, includeRole: boolean = false): any[] {
     if (!content || !this.plan.shouldParseResponse) return []
 
@@ -22,25 +30,35 @@ export class ToolStreamParser {
       const markerStart = findMarkerStart(this.buffer, this.plan)
       if (markerStart.matched) {
         if (markerStart.index > 0) {
-          chunks.push(createContentChunk(baseChunk, this.buffer.slice(0, markerStart.index), includeRole))
+          const prefix = sanitizeAssistantText(this.buffer.slice(0, markerStart.index), false)
+          if (prefix) {
+            chunks.push(createContentChunk(baseChunk, prefix, includeRole))
+          }
         }
         this.buffer = this.buffer.slice(markerStart.index)
         this.isBufferingToolCall = true
       } else if (markerStart.partial) {
         if (markerStart.index > 0) {
-          chunks.push(createContentChunk(baseChunk, this.buffer.slice(0, markerStart.index), includeRole))
+          const prefix = sanitizeAssistantText(this.buffer.slice(0, markerStart.index), false)
+          if (prefix) {
+            chunks.push(createContentChunk(baseChunk, prefix, includeRole))
+          }
           this.buffer = this.buffer.slice(markerStart.index)
         }
         this.isBufferingToolCall = true
         return chunks
       } else {
-        chunks.push(createContentChunk(baseChunk, this.buffer, includeRole))
+        // Stream deltas: keep whitespace; only strip control tokens.
+        const text = sanitizeAssistantText(this.buffer, false)
         this.buffer = ''
+        if (text) {
+          chunks.push(createContentChunk(baseChunk, text, includeRole))
+        }
         return chunks
       }
     }
 
-    const parsed = parseBufferedToolCall(this.buffer, this.plan)
+    const parsed = parseToolContentWithFallback(this.buffer, this.plan)
     if (parsed.toolCalls.length > 0) {
       for (const toolCall of parsed.toolCalls) {
         const indexedToolCall = {
@@ -53,6 +71,7 @@ export class ToolStreamParser {
       }
       this.emittedToolCall = true
       this.isBufferingToolCall = false
+      // Suppress trailing junk after tool calls (DSML crumbs, end tokens, etc.)
       this.buffer = ''
       return chunks
     }
@@ -65,10 +84,13 @@ export class ToolStreamParser {
     return chunks
   }
 
+  /**
+   * Flush remaining buffer at stream end.
+   */
   flush(baseChunk: any): any[] {
     if (!this.buffer) return []
 
-    const parsed = parseBufferedToolCall(this.buffer, this.plan)
+    const parsed = parseToolContentWithFallback(this.buffer, this.plan)
     if (parsed.toolCalls.length > 0) {
       const chunks = parsed.toolCalls.map((toolCall) => {
         const indexedToolCall = {
@@ -85,11 +107,17 @@ export class ToolStreamParser {
       return chunks
     }
 
-    const shouldReleaseText = !this.emittedToolCall
-    const text = this.buffer
+    // After a tool call, never release leftover protocol junk as chat text.
+    if (this.emittedToolCall || looksLikeToolProtocolPrefix(this.buffer)) {
+      this.buffer = ''
+      this.isBufferingToolCall = false
+      return []
+    }
+
+    const text = sanitizeAssistantText(this.buffer)
     this.buffer = ''
     this.isBufferingToolCall = false
-    return shouldReleaseText ? [createContentChunk(baseChunk, text, false)] : []
+    return text ? [createContentChunk(baseChunk, text, false)] : []
   }
 
   hasEmittedToolCall(): boolean {
@@ -101,13 +129,14 @@ export class ToolStreamParser {
   }
 }
 
-function parseBufferedToolCall(buffer: string, plan: ToolCallingPlan) {
-  const selected = getToolProtocol(plan.protocol)
-  return selected.parse(buffer, { tools: plan.tools, protocol: plan.protocol })
-}
-
-function findMarkerStart(buffer: string, plan: ToolCallingPlan): { matched: boolean; partial: boolean; index: number } {
-  const protocol = getToolProtocol(plan.protocol)
+/**
+ * Detect the earliest preferred or DSML tool-protocol marker in the buffer.
+ */
+function findMarkerStart(
+  buffer: string,
+  plan: ToolCallingPlan,
+): { matched: boolean; partial: boolean; index: number } {
+  const watchers = getStreamWatchProtocols(plan.protocol)
   const ranges = fencedRanges(buffer)
   let partialIndex = -1
 
@@ -115,12 +144,23 @@ function findMarkerStart(buffer: string, plan: ToolCallingPlan): { matched: bool
     if (isInsideRange(index, ranges)) continue
 
     const suffix = buffer.slice(index)
-    const detection = protocol.detectStart(suffix)
-    if (detection.matched && detection.markerStart === 0) {
+    for (const protocol of watchers) {
+      const detection = protocol.detectStart(suffix)
+      if (detection.matched && detection.markerStart === 0) {
+        return { matched: true, partial: false, index }
+      }
+      if (detection.partial && detection.markerStart === 0 && partialIndex === -1) {
+        partialIndex = index
+      }
+    }
+
+    // Broken Chat2API without leading '<' (do not match inside <|CHAT2API|...>)
+    const prev = index > 0 ? buffer[index - 1] : ''
+    if (suffix.startsWith('|CHAT2API|') && prev !== '<') {
       return { matched: true, partial: false, index }
     }
-    if (detection.partial && detection.markerStart === 0 && partialIndex === -1) {
-      partialIndex = index
+    if (prev !== '<' && '|CHAT2API|'.startsWith(suffix) && suffix.startsWith('|')) {
+      if (partialIndex === -1) partialIndex = index
     }
   }
 

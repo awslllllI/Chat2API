@@ -8,6 +8,7 @@ import {
 import { getToolProtocol } from './protocols/index.ts'
 import { getToolClientAdapter } from './clientAdapters/index.ts'
 import { buildToolCallingRuntimePlan } from './runtimePlan.ts'
+import { parseToolContentWithFallback } from './parseFallback.ts'
 import type { NormalizedToolDefinition, ToolCallingPlan, ToolCallingTransformResult, ToolProtocolId } from './types.ts'
 
 export class ToolCallingEngine {
@@ -106,7 +107,9 @@ function injectPrompt(messages: ChatMessage[], prompt: string): ChatMessage[] {
   return [{ role: 'system', content: prompt }, ...messages]
 }
 
+/**
+ * Parse non-stream assistant content with preferred protocol + DSML fallback.
+ */
 function parseSelectedProtocol(content: string, plan: ToolCallingPlan) {
-  const selected = getToolProtocol(plan.protocol)
-  return selected.parse(content, { tools: plan.tools, protocol: plan.protocol })
+  return parseToolContentWithFallback(content, plan)
 }

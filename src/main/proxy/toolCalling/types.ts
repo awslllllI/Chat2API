@@ -7,6 +7,7 @@ export type ToolProtocolId =
   | 'managed_xml'
   | 'anthropic_tool_use'
   | 'codex_responses'
+  | 'deepseek_dsml'
 
 export type ToolSource = 'openai' | 'mcp'
 

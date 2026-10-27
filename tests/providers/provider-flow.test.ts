@@ -591,18 +591,27 @@ test('DeepSeek forwarder preserves requested model aliases for response parsing 
   assert.match(source, /new DeepSeekStreamHandler\(\s*actualModel,[\s\S]*transformed\.plan,\s*request\.model\s*\)/)
 })
 
-test('active source no longer exposes DS2API or DSML tool protocol markers', () => {
-  const activeFiles = [
-    'src/main/proxy/toolCalling/ToolCallingEngine.ts',
+test('prompt/UI sources do not advertise DS2API or DSML; dedicated DSML fallback parser is allowed', () => {
+  const promptUiFiles = [
     'src/main/proxy/toolCalling/providerProfiles.ts',
     'src/main/proxy/toolCalling/protocols/managedXml.ts',
     'src/renderer/src/pages/Models.tsx',
   ]
 
-  for (const file of activeFiles) {
+  for (const file of promptUiFiles) {
     const source = readFileSync(join(root, file), 'utf8')
     assert.doesNotMatch(source, /DS2API|DSML/i, file)
   }
+
+  // Engine may mention DSML only via fallback import path; keep DS2API banned.
+  const engine = readFileSync(join(root, 'src/main/proxy/toolCalling/ToolCallingEngine.ts'), 'utf8')
+  assert.doesNotMatch(engine, /DS2API/i)
+
+  const dsmlParser = readFileSync(
+    join(root, 'src/main/proxy/toolCalling/protocols/deepseekDsml.ts'),
+    'utf8',
+  )
+  assert.match(dsmlParser, /deepseek_dsml/)
 })
 
 test('tool calling UI copy hides internal managed protocol ids', () => {
