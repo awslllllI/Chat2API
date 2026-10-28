@@ -5,6 +5,7 @@
 
 import axios, { AxiosResponse } from 'axios'
 import { Account, Provider } from '../../store/types'
+import { storeManager } from '../../store/store'
 import { PassThrough } from 'stream'
 import { toolsToSystemPrompt, TOOL_WRAP_HINT, hasToolPromptInjected } from '../utils/tools'
 import { parseToolCallsFromText } from '../utils/toolParser'
@@ -13,6 +14,13 @@ import { createKimiChatPayload, encodeKimiGrpcFrame } from './providerModelOptio
 import { getProviderToolProfile } from '../toolCalling/providerProfiles'
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
 import type { ToolCallingPlan } from '../toolCalling/types'
+import {
+  decodeKimiJwtPayload,
+  isKimiAccessFresh,
+  isKimiAccessJwt,
+  pickKimiCredentials,
+  refreshKimiWebTokens,
+} from './kimi-auth'
 
 const KIMI_API_BASE = 'https://www.kimi.com'
 
@@ -67,26 +75,12 @@ function unixTimestamp(): number {
 }
 
 export function detectTokenType(token: string): 'jwt' | 'refresh' {
-  if (token.startsWith('eyJ') && token.split('.').length === 3) {
-    try {
-      const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString())
-      if (payload.app_id === 'kimi' && payload.typ === 'access') {
-        return 'jwt'
-      }
-    } catch (e) {
-      // Parse failed, treat as refresh token
-    }
-  }
-  return 'refresh'
+  return isKimiAccessJwt(token) ? 'jwt' : 'refresh'
 }
 
 function extractUserIdFromJWT(token: string): string | undefined {
-  try {
-    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString())
-    return payload.sub
-  } catch (e) {
-    return undefined
-  }
+  const payload = decodeKimiJwtPayload(token)
+  return typeof payload?.sub === 'string' ? payload.sub : undefined
 }
 
 function checkResult(result: AxiosResponse, refreshToken: string): any {
@@ -115,43 +109,105 @@ export class KimiAdapter {
   constructor(provider: Provider, account: Account) {
     this.provider = provider
     this.account = account
-    this.token = account.credentials.token || account.credentials.refreshToken || ''
+    const picked = pickKimiCredentials(account.credentials)
+    this.token = picked.refreshToken || picked.accessToken || account.credentials.token || ''
   }
 
-  private async acquireToken(): Promise<{ accessToken: string; userId: string }> {
-    if (!this.token) {
-      throw new Error('Kimi Token not configured')
-    }
+  /**
+   * Cache key prefers refresh_token so rotated access stays under one entry.
+   */
+  private cacheKey(): string {
+    const picked = pickKimiCredentials(this.account.credentials)
+    return picked.refreshToken || picked.accessToken || this.token || this.account.id
+  }
 
-    let result = accessTokenMap.get(this.token)
-    if (result && result.refreshTime > unixTimestamp()) {
+  /**
+   * Drop cached access for this account.
+   */
+  private invalidateTokenCache(): void {
+    accessTokenMap.delete(this.cacheKey())
+    if (this.token) accessTokenMap.delete(this.token)
+  }
+
+  /**
+   * Persist rotated token pair back to the account store (immutable update).
+   */
+  private async persistTokenPair(accessToken: string, refreshToken: string): Promise<void> {
+    const nextCredentials = {
+      ...this.account.credentials,
+      token: accessToken,
+      refresh_token: refreshToken,
+    }
+    this.account = {
+      ...this.account,
+      credentials: nextCredentials,
+    }
+    this.token = refreshToken || accessToken
+    try {
+      await storeManager.updateAccount(this.account.id, { credentials: nextCredentials })
+    } catch (error) {
+      console.warn(
+        '[Kimi] Failed to persist refreshed credentials:',
+        error instanceof Error ? error.message : error,
+      )
+    }
+  }
+
+  /**
+   * Acquire a fresh access JWT; refresh via auth gateway when possible.
+   */
+  private async acquireToken(forceRefresh: boolean = false): Promise<{ accessToken: string; userId: string }> {
+    const picked = pickKimiCredentials(this.account.credentials)
+    const cacheKey = this.cacheKey()
+    const cached = accessTokenMap.get(cacheKey)
+    if (
+      !forceRefresh &&
+      cached &&
+      cached.refreshTime > unixTimestamp() &&
+      isKimiAccessFresh(cached.accessToken)
+    ) {
       console.log('[Kimi] Using cached token')
-      return { accessToken: result.accessToken, userId: result.userId }
+      return { accessToken: cached.accessToken, userId: cached.userId }
     }
 
-    const tokenType = detectTokenType(this.token)
-    console.log('[Kimi] Token type:', tokenType)
-
-    if (tokenType === 'jwt') {
-      const userId = extractUserIdFromJWT(this.token) || ''
-      accessTokenMap.set(this.token, {
-        accessToken: this.token,
-        refreshToken: this.token,
+    if (!forceRefresh && picked.accessToken && isKimiAccessFresh(picked.accessToken)) {
+      const userId = extractUserIdFromJWT(picked.accessToken) || ''
+      accessTokenMap.set(cacheKey, {
+        accessToken: picked.accessToken,
+        refreshToken: picked.refreshToken || picked.accessToken,
         userId,
         refreshTime: unixTimestamp() + 300,
       })
       console.log('[Kimi] Using JWT token, userId:', userId)
-      return { accessToken: this.token, userId }
+      return { accessToken: picked.accessToken, userId }
     }
 
-    console.log('[Kimi] Non-JWT token detected, attempting direct use...')
-    accessTokenMap.set(this.token, {
-      accessToken: this.token,
-      refreshToken: this.token,
-      userId: '',
-      refreshTime: unixTimestamp() + 300,
+    if (!picked.refreshToken) {
+      if (picked.accessToken) {
+        throw new Error(
+          'Kimi access JWT expired and no refresh_token is stored. Re-login via OAuth or paste localStorage refresh_token.',
+        )
+      }
+      throw new Error('Kimi Token not configured')
+    }
+
+    console.log('[Kimi] Refreshing access token via auth gateway...')
+    const webOrigin = this.provider.apiEndpoint?.includes('kimi.ai')
+      ? 'https://www.kimi.ai'
+      : 'https://www.kimi.com'
+    const refreshed = await refreshKimiWebTokens(picked.refreshToken, { webOrigin })
+    await this.persistTokenPair(refreshed.accessToken, refreshed.refreshToken)
+
+    const userId = refreshed.userId || extractUserIdFromJWT(refreshed.accessToken) || ''
+    const nextKey = refreshed.refreshToken || cacheKey
+    accessTokenMap.set(nextKey, {
+      accessToken: refreshed.accessToken,
+      refreshToken: refreshed.refreshToken,
+      userId,
+      refreshTime: Math.min(refreshed.expiresAt, unixTimestamp() + 300),
     })
-    return { accessToken: this.token, userId: '' }
+    console.log('[Kimi] Token refresh successful, userId:', userId, 'rotated:', refreshed.rotated)
+    return { accessToken: refreshed.accessToken, userId }
   }
 
   private messagesPrepare(messages: KimiMessage[], toolsPrompt?: string, isMultiTurn: boolean = false): string {
@@ -276,7 +332,17 @@ export class KimiAdapter {
   }
 
   async chatCompletion(request: ChatCompletionRequest): Promise<{ response: AxiosResponse; conversationId: string }> {
-    const { accessToken } = await this.acquireToken()
+    return this.chatCompletionWithAuthRetry(request, false)
+  }
+
+  /**
+   * Send chat; on 401 force-refresh once when refresh_token is available.
+   */
+  private async chatCompletionWithAuthRetry(
+    request: ChatCompletionRequest,
+    isRetry: boolean,
+  ): Promise<{ response: AxiosResponse; conversationId: string }> {
+    const { accessToken } = await this.acquireToken(isRetry)
 
     const messages = [...request.messages]
 
@@ -310,10 +376,10 @@ export class KimiAdapter {
     // Use originalModel for feature detection (preserves user's intent before mapping)
     const modelForDetection = request.originalModel || request.model
     const modelLower = modelForDetection.toLowerCase()
-    
+
     let enableThinking = request.enableThinking ?? false
     let enableWebSearch = request.enableWebSearch ?? false
-    
+
     // Auto-enable based on model name (if not explicitly set)
     if (!enableThinking && (modelLower.includes('think') || modelLower.includes('r1'))) {
       enableThinking = true
@@ -346,13 +412,24 @@ export class KimiAdapter {
         timeout: 120000,
         validateStatus: () => true,
         responseType: 'stream',
-      }
+      },
     )
 
     console.log('[Kimi] Completion response status:', response.status)
 
     if (response.status === 401) {
-      accessTokenMap.delete(this.token)
+      this.invalidateTokenCache()
+      const hasRefresh = Boolean(pickKimiCredentials(this.account.credentials).refreshToken)
+      if (!isRetry && hasRefresh) {
+        console.warn('[Kimi] Chat 401 — forcing refresh and retrying once')
+        // Drain/destroy unread error stream before retry
+        try {
+          response.data?.destroy?.()
+        } catch {
+          /* ignore */
+        }
+        return this.chatCompletionWithAuthRetry(request, true)
+      }
       throw new Error('Token invalid or expired')
     }
 

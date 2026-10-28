@@ -376,6 +376,34 @@ export class OAuthManager extends EventEmitter {
           }
         }
 
+        // For Kimi, wait for localStorage refresh_token when possible (access JWT alone is short-lived).
+        if (providerType === 'kimi') {
+          const hasRefresh = Boolean(collectedTokens.refresh_token)
+          const hasAccess = Boolean(collectedTokens.access_token || collectedTokens.token)
+          if (!hasRefresh) {
+            console.log('[OAuthManager] Kimi: waiting for refresh_token...', {
+              hasAccess,
+              keys: Object.keys(collectedTokens),
+            })
+            if (validationTimeout) {
+              clearTimeout(validationTimeout)
+            }
+            // Allow networkHeader-only fallback after a short wait if refresh never appears.
+            validationTimeout = setTimeout(() => {
+              console.log('[OAuthManager] Kimi: proceeding without refresh_token after wait')
+              validateAndComplete()
+            }, 1500)
+            return
+          }
+          if (!isValidating) {
+            if (validationTimeout) {
+              clearTimeout(validationTimeout)
+            }
+            validateAndComplete()
+            return
+          }
+        }
+
         // For Mimo, we need all three tokens before validating
         if (providerType === 'mimo') {
           const hasServiceToken = collectedTokens.serviceToken || collectedTokens.service_token
@@ -413,8 +441,8 @@ export class OAuthManager extends EventEmitter {
           }
         }
 
-        // For non-MiniMax/Mimo providers, validate immediately when we have a token
-        if (providerType !== 'minimax' && providerType !== 'mimo') {
+        // For non-MiniMax/Mimo/Kimi providers, validate immediately when we have a token
+        if (providerType !== 'minimax' && providerType !== 'mimo' && providerType !== 'kimi') {
           if (isValidating) {
             console.log('[OAuthManager] Already validating, skipping')
             return
@@ -482,6 +510,34 @@ export class OAuthManager extends EventEmitter {
               ph_token: phToken,
             }
             console.log('[OAuthManager] Mimo: Final credentials prepared:', Object.keys(finalCredentials))
+          } else if (providerType === 'kimi') {
+            let access =
+              collectedTokens.access_token || collectedTokens.token || collectedTokens.accessToken || ''
+            let refresh = collectedTokens.refresh_token || collectedTokens.refreshToken || ''
+            // Mint a fresh access JWT when refresh_token is present so we never persist a near-expiry snapshot only.
+            if (refresh) {
+              const refreshed = await adapter.refreshToken({
+                token: access,
+                refresh_token: refresh,
+              })
+              if (refreshed?.value) {
+                access = refreshed.value
+                refresh = refreshed.refreshToken || refreshed.extra?.refresh_token || refresh
+              }
+            }
+            validationCredentials = {
+              token: access,
+              refresh_token: refresh,
+              access_token: access,
+            }
+            finalCredentials = {
+              token: access,
+              refresh_token: refresh,
+            }
+            console.log('[OAuthManager] Kimi: credentials prepared', {
+              hasAccess: Boolean(access),
+              hasRefresh: Boolean(refresh),
+            })
           } else {
             validationCredentials = { ...collectedTokens }
             finalCredentials = { ...collectedTokens }

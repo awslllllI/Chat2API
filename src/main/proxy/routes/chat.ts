@@ -27,6 +27,10 @@ import {
   transformResponseToAnthropic,
   transformChunkToAnthropic
 } from '../utils/toolFormatConverter'
+import {
+  createUsageInjectTransform,
+  ensureCompletionUsage,
+} from '../utils/usageEstimate'
 
 const router = new Router({ prefix: '/v1/chat' })
 
@@ -427,8 +431,39 @@ router.post('/completions', async (ctx: Context) => {
       // Create a wrapper stream to handle errors and collect content
       const wrapperStream = new PassThrough()
 
-      // Collect stream content for logging (raw SSE output)
+      // Collect stream content for logging (raw SSE output after usage inject)
       let collectedContent = ''
+
+      // Inject OpenAI-style final usage so DSH meters / compaction can read tokens
+      const usageInject = createUsageInjectTransform({
+        requestId,
+        model: actualModel,
+        messages: request.messages || [],
+        tools: request.tools,
+        force: true,
+      })
+
+      usageInject.on('data', (chunk: Buffer) => {
+        collectedContent += chunk.toString()
+      })
+
+      usageInject.once('end', () => {
+        if (logEntryId) {
+          storeManager.updateRequestLog(logEntryId, {
+            responseBody: collectedContent || undefined,
+          })
+        }
+        wrapperStream.end()
+      })
+
+      usageInject.once('error', (err: Error) => {
+        console.error('[Chat] Usage inject stream error:', err.message)
+        if (!wrapperStream.destroyed) {
+          wrapperStream.destroy(err)
+        }
+      })
+
+      usageInject.pipe(wrapperStream, { end: false })
 
       // Handle stream errors
       result.stream.once('error', (err: Error) => {
@@ -449,9 +484,11 @@ router.post('/completions', async (ctx: Context) => {
           }],
         }
 
-        wrapperStream.write(`data: ${JSON.stringify(errorEvent)}\n\n`)
-        wrapperStream.write('data: [DONE]\n\n')
-        wrapperStream.end()
+        if (!usageInject.destroyed) {
+          usageInject.write(`data: ${JSON.stringify(errorEvent)}\n\n`)
+          usageInject.write('data: [DONE]\n\n')
+          usageInject.end()
+        }
 
         storeManager.addLog('error', `Stream error: ${err.message}`, {
           requestId,
@@ -463,23 +500,7 @@ router.post('/completions', async (ctx: Context) => {
 
       // Check if stream is already in correct SSE format (from adapters like Kimi, GLM, DeepSeek)
       if (result.skipTransform) {
-        // Stream is already formatted, pipe through wrapper and collect
-        result.stream.on('data', (chunk: Buffer) => {
-          collectedContent += chunk.toString()
-        })
-
-        result.stream.pipe(wrapperStream, { end: false })
-
-        // When source stream ends normally, update log and end wrapper
-        result.stream.once('end', () => {
-          // Update log with collected response
-          if (logEntryId) {
-            storeManager.updateRequestLog(logEntryId, {
-              responseBody: collectedContent || undefined,
-            })
-          }
-          wrapperStream.end()
-        })
+        result.stream.pipe(usageInject)
       } else {
         // Need to transform the stream
         const transformStream = streamHandler.createTransformStream(
@@ -490,23 +511,8 @@ router.post('/completions', async (ctx: Context) => {
           }
         )
 
-        // Collect from transform stream output
-        transformStream.on('data', (chunk: Buffer) => {
-          collectedContent += chunk.toString()
-        })
-
         result.stream.pipe(transformStream)
-        transformStream.pipe(wrapperStream, { end: false })
-
-        transformStream.once('end', () => {
-          // Update log with collected response
-          if (logEntryId) {
-            storeManager.updateRequestLog(logEntryId, {
-              responseBody: collectedContent || undefined,
-            })
-          }
-          wrapperStream.end()
-        })
+        transformStream.pipe(usageInject)
       }
 
       ctx.body = wrapperStream
@@ -514,12 +520,17 @@ router.post('/completions', async (ctx: Context) => {
       ctx.set('Content-Type', 'application/json')
 
       if (result.body) {
+        const withUsage = ensureCompletionUsage(
+          result.body,
+          request.messages || [],
+          request.tools
+        )
         // Check if we need to transform to Anthropic format
         if (isAnthropicToolFormat(request.tool_format)) {
-          ctx.body = transformResponseToAnthropic(result.body)
+          ctx.body = transformResponseToAnthropic(withUsage)
           console.log('[Chat] Transformed response to Anthropic tool format')
         } else {
-          ctx.body = result.body
+          ctx.body = withUsage
         }
       } else {
         ctx.body = {

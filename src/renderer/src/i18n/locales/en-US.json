@@ -273,8 +273,11 @@
     "name": "Kimi",
     "description": "Kimi AI assistant, supports long text processing and web search",
     "accessToken": "Access Token",
-    "accessTokenPlaceholder": "Enter Kimi Access Token or Refresh Token",
-    "accessTokenHelp": "The kimi-auth value from browser cookies (recommended), or JWT Token / refresh_token"
+    "accessTokenPlaceholder": "Optional short-lived access JWT / kimi-auth",
+    "accessTokenHelp": "~15 minutes. Optional when refresh_token is present (auto-renewed).",
+    "refreshToken": "Refresh Token",
+    "refreshTokenPlaceholder": "localStorage refresh_token",
+    "refreshTokenHelp": "Recommended. DevTools → Application → Local Storage → refresh_token (~90 days)."
   },
   "minimax": {
     "name": "MiniMax",

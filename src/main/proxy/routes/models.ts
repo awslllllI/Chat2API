@@ -1,16 +1,31 @@
 /**
  * Proxy Service Module - Models Route
- * Implements /v1/models route
+ * Implements /v1/models route with capability metadata for DSH autofill plugins
  */
 
 import Router from '@koa/router'
 import type { Context } from 'koa'
 import { ModelsResponse, ModelInfo } from '../types'
-import { loadBalancer } from '../loadbalancer'
 import { storeManager } from '../../store/store'
-import { modelMapper } from '../modelMapper'
+import { enrichModelInfo } from '../config/modelMeta'
 
 const router = new Router({ prefix: '/v1' })
+
+/**
+ * Build a model list entry with optional capability extensions.
+ */
+function buildModelEntry(
+  id: string,
+  created: number,
+  ownedBy: string
+): ModelInfo {
+  return enrichModelInfo({
+    id,
+    object: 'model',
+    created,
+    owned_by: ownedBy,
+  }) as ModelInfo
+}
 
 /**
  * Get all available models
@@ -32,27 +47,25 @@ router.get('/models', async (ctx: Context) => {
     for (const model of effectiveModels) {
       if (!addedModels.has(model.displayName)) {
         addedModels.add(model.displayName)
-        models.push({
-          id: model.displayName,
-          object: 'model',
-          created: Math.floor(provider.createdAt / 1000),
-          owned_by: provider.name,
-        })
+        models.push(buildModelEntry(
+          model.displayName,
+          Math.floor(provider.createdAt / 1000),
+          provider.name,
+        ))
       }
     }
   }
 
   const config = storeManager.getConfig()
   const mappings = config.modelMappings || {}
-  for (const [requestModel, mapping] of Object.entries(mappings)) {
+  for (const [requestModel] of Object.entries(mappings)) {
     if (!addedModels.has(requestModel)) {
       addedModels.add(requestModel)
-      models.push({
-        id: requestModel,
-        object: 'model',
-        created: Math.floor(Date.now() / 1000),
-        owned_by: 'model-mapping',
-      })
+      models.push(buildModelEntry(
+        requestModel,
+        Math.floor(Date.now() / 1000),
+        'model-mapping',
+      ))
     }
   }
 
@@ -75,12 +88,7 @@ router.get('/models/:model', async (ctx: Context) => {
   const mappings = config.modelMappings || {}
   if (mappings[modelId]) {
     ctx.set('Content-Type', 'application/json')
-    ctx.body = {
-      id: modelId,
-      object: 'model',
-      created: Math.floor(Date.now() / 1000),
-      owned_by: 'model-mapping',
-    }
+    ctx.body = buildModelEntry(modelId, Math.floor(Date.now() / 1000), 'model-mapping')
     return
   }
 
@@ -106,14 +114,26 @@ router.get('/models/:model', async (ctx: Context) => {
 
     if (found) {
       ctx.set('Content-Type', 'application/json')
-      ctx.body = {
-        id: modelId,
-        object: 'model',
-        created: Math.floor(provider.createdAt / 1000),
-        owned_by: provider.name,
-      }
+      ctx.body = buildModelEntry(
+        modelId,
+        Math.floor(provider.createdAt / 1000),
+        provider.name,
+      )
       return
     }
+  }
+
+  // Still return enriched stub for known catalog ids so discovery plugins can fill
+  const enriched = enrichModelInfo({
+    id: modelId,
+    object: 'model',
+    created: Math.floor(Date.now() / 1000),
+    owned_by: 'unknown',
+  }, modelId)
+  if ((enriched as any).context_length) {
+    ctx.set('Content-Type', 'application/json')
+    ctx.body = enriched
+    return
   }
 
   ctx.status = 404

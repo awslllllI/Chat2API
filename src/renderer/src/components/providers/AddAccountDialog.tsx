@@ -40,6 +40,15 @@ import { getCreateDefaultsForProvider } from '../../../../shared/rateLimitDefaul
 function mapOAuthCredentials(providerId: string | undefined, credentials: Record<string, string>): Record<string, string> {
   if (!providerId) return credentials
 
+  if (providerId === 'kimi') {
+    const access = credentials.token || credentials.access_token || credentials.accessToken || ''
+    const refresh = credentials.refresh_token || credentials.refreshToken || ''
+    const mapped: Record<string, string> = {}
+    if (access) mapped.token = access
+    if (refresh) mapped.refresh_token = refresh
+    if (Object.keys(mapped).length > 0) return mapped
+  }
+
   const credentialKeyMap: Record<string, string> = {
     'glm': 'chatglm_refresh_token',
     'deepseek': 'userToken',
@@ -648,6 +657,11 @@ function CredentialFieldsForm({ fields, credentials, onChange, t, providerId }: 
           label: t('kimi.accessToken'),
           placeholder: t('kimi.accessTokenPlaceholder'),
           helpText: t('kimi.accessTokenHelp'),
+        },
+        refresh_token: {
+          label: t('kimi.refreshToken'),
+          placeholder: t('kimi.refreshTokenPlaceholder'),
+          helpText: t('kimi.refreshTokenHelp'),
         },
       },
       minimax: {

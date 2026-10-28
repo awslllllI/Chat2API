@@ -26,6 +26,15 @@ export const TOKEN_EXTRACTION_CONFIGS: Record<ProviderType, TokenExtractionConfi
   kimi: {
     loginUrl: 'https://www.kimi.com',
     tokenSources: [
+      // Prefer durable refresh_token from localStorage; access JWT alone expires ~15m.
+      {
+        type: 'localStorage',
+        key: 'refresh_token',
+      },
+      {
+        type: 'localStorage',
+        key: 'access_token',
+      },
       {
         type: 'networkHeader',
         key: 'token',

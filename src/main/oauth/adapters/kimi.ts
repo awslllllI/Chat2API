@@ -14,6 +14,12 @@ import {
   AdapterConfig,
   OAuthCallbackData,
 } from '../types'
+import {
+  isKimiAccessJwt,
+  normalizeKimiRefreshToken,
+  pickKimiCredentials,
+  refreshKimiWebTokens,
+} from '../../proxy/adapters/kimi-auth'
 
 const KIMI_API_BASE = 'https://www.kimi.com'
 
@@ -71,17 +77,7 @@ export class KimiAdapter extends BaseOAuthAdapter {
    * Reference: detectTokenType function from Kimi-Free-API
    */
   detectTokenType(token: string): 'jwt' | 'refresh' {
-    if (token.startsWith('eyJ') && token.split('.').length === 3) {
-      try {
-        const payload = this.parseJWT(token)
-        if (payload && payload.app_id === 'kimi' && payload.typ === 'access') {
-          return 'jwt'
-        }
-      } catch {
-        // Parse failed, treat as refresh token
-      }
-    }
-    return 'refresh'
+    return isKimiAccessJwt(token) ? 'jwt' : 'refresh'
   }
 
   /**
@@ -253,28 +249,57 @@ export class KimiAdapter extends BaseOAuthAdapter {
    * Validate token validity using gRPC API
    */
   async validateToken(credentials: Record<string, string>): Promise<TokenValidationResult> {
-    // Support multiple key variations for flexibility
-    const accessToken = credentials.accessToken || credentials.token || credentials.access_token || credentials.apiKey || credentials.api_key
-    
+    const picked = pickKimiCredentials(credentials)
+    let accessToken =
+      picked.accessToken ||
+      credentials.accessToken ||
+      credentials.token ||
+      credentials.access_token ||
+      credentials.apiKey ||
+      credentials.api_key ||
+      ''
+
+    // Prefer refreshing when we only have refresh_token (or access is stale JWT without being checked here).
+    if ((!accessToken || !isKimiAccessJwt(accessToken)) && picked.refreshToken) {
+      try {
+        const refreshed = await refreshKimiWebTokens(picked.refreshToken)
+        accessToken = refreshed.accessToken
+        credentials = {
+          ...credentials,
+          token: refreshed.accessToken,
+          refresh_token: refreshed.refreshToken,
+        }
+      } catch (error) {
+        return {
+          valid: false,
+          error: error instanceof Error ? error.message : 'Kimi refresh failed',
+        }
+      }
+    }
+
     if (!accessToken) {
       return {
         valid: false,
-        error: 'Token cannot be empty',
+        error: 'Token cannot be empty (need access JWT or refresh_token)',
       }
     }
-    
+
     const tokenType = this.detectTokenType(accessToken)
-    
+
     try {
-      const result = await this.callGrpcApi(accessToken, '/apiv2/kimi.gateway.order.v1.SubscriptionService/GetSubscription', {})
-      
+      const result = await this.callGrpcApi(
+        accessToken,
+        '/apiv2/kimi.gateway.order.v1.SubscriptionService/GetSubscription',
+        {},
+      )
+
       if (!result || !result.subscription) {
         return {
           valid: false,
           error: 'Token is invalid or expired',
         }
       }
-      
+
       return {
         valid: true,
         tokenType,
@@ -293,10 +318,30 @@ export class KimiAdapter extends BaseOAuthAdapter {
   }
 
   /**
-   * Refresh token - Kimi no longer supports refresh token API
+   * Refresh Kimi web session via auth.kimi.com gateway.
    */
   async refreshToken(credentials: Record<string, string>): Promise<CredentialInfo | null> {
-    return null
+    const picked = pickKimiCredentials(credentials)
+    const refresh = picked.refreshToken || normalizeKimiRefreshToken(credentials.token)
+    if (!refresh || isKimiAccessJwt(refresh)) {
+      return null
+    }
+    try {
+      const refreshed = await refreshKimiWebTokens(refresh)
+      return {
+        type: 'jwt',
+        value: refreshed.accessToken,
+        refreshToken: refreshed.refreshToken,
+        expiresAt: refreshed.expiresAt * 1000,
+        extra: {
+          token: refreshed.accessToken,
+          refresh_token: refreshed.refreshToken,
+        },
+      }
+    } catch (error) {
+      console.warn('[KimiOAuth] refreshToken failed:', error instanceof Error ? error.message : error)
+      return null
+    }
   }
 
   /**

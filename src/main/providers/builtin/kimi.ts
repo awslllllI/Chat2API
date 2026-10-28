@@ -35,11 +35,19 @@ export const kimiConfig: BuiltinProviderConfig = {
   credentialFields: [
     {
       name: 'token',
-      label: '访问令牌',
+      label: '访问令牌 (access)',
       type: 'password',
-      required: true,
-      placeholder: '请输入 Kimi 访问令牌或刷新令牌',
-      helpText: '浏览器 Cookie 中的 kimi-auth 字段值（推荐），或 JWT Token / refresh_token',
+      required: false,
+      placeholder: '可选：短命 access JWT / kimi-auth',
+      helpText: '可空。有 refresh_token 时会自动换票；仅填 access 约 15 分钟过期',
+    },
+    {
+      name: 'refresh_token',
+      label: '刷新令牌 (refresh_token)',
+      type: 'password',
+      required: false,
+      placeholder: 'localStorage.refresh_token（推荐，可自动续命）',
+      helpText: 'DevTools → Application → Local Storage → refresh_token；约 90 天。无此项时仅短命 access 会很快 401',
     },
   ],
   tokenCheckEndpoint: '/api/auth/token/refresh',

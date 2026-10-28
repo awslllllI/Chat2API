@@ -272,9 +272,12 @@
   "kimi": {
     "name": "Kimi",
     "description": "Kimi AI 助手，支持长文本处理和联网搜索",
-    "accessToken": "访问令牌",
-    "accessTokenPlaceholder": "请输入 Kimi 访问令牌或刷新令牌",
-    "accessTokenHelp": "浏览器 Cookie 中的 kimi-auth 字段值（推荐），也可使用 JWT Token 或 refresh_token"
+    "accessToken": "访问令牌 (access)",
+    "accessTokenPlaceholder": "可选：短命 access JWT / kimi-auth",
+    "accessTokenHelp": "约 15 分钟有效；有 refresh_token 时会自动续期，可不填",
+    "refreshToken": "刷新令牌 (refresh_token)",
+    "refreshTokenPlaceholder": "Local Storage 的 refresh_token",
+    "refreshTokenHelp": "推荐。DevTools → Application → Local Storage → refresh_token；约 90 天，代理自动换 access"
   },
   "minimax": {
     "name": "MiniMax",

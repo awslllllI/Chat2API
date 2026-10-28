@@ -70,6 +70,10 @@ export interface ChatCompletionRequest {
   top_p?: number
   n?: number
   stream?: boolean
+  /** OpenAI streaming options; include_usage requests a final usage chunk */
+  stream_options?: {
+    include_usage?: boolean
+  }
   stop?: string | string[]
   max_tokens?: number
   presence_penalty?: number
@@ -174,7 +178,7 @@ export interface ToolCall {
 }
 
 /**
- * Model Information
+ * Model Information (OpenAI core + Chat2API / DSH-friendly extensions)
  */
 export interface ModelInfo {
   id: string
@@ -184,6 +188,26 @@ export interface ModelInfo {
   permission?: ModelPermission[]
   root?: string
   parent?: string
+  /** Display name */
+  name?: string
+  /** Combined context window (tokens) */
+  context_length?: number
+  context_window?: number
+  max_model_len?: number
+  /** Maximum completion tokens */
+  max_tokens?: number
+  max_output_tokens?: number
+  max_completion_tokens?: number
+  /** Input modalities */
+  input_modalities?: Array<'text' | 'image' | string>
+  supported_modalities?: Array<'text' | 'image' | string>
+  modalities?: Array<'text' | 'image' | string>
+  supports_vision?: boolean
+  architecture?: {
+    modality?: string
+    input_modalities?: Array<'text' | 'image' | string>
+    output_modalities?: Array<'text' | 'image' | string>
+  }
 }
 
 /**
