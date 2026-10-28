@@ -12,6 +12,7 @@ import { createParser, EventSourceMessage } from 'eventsource-parser'
 import FormData from 'form-data'
 import { Account, Provider } from '../../store/types'
 import { toolsToSystemPrompt, TOOL_WRAP_HINT, hasToolPromptInjected, shouldInjectToolPrompt } from '../utils/tools'
+import { resolveMediaPromptAppendix } from '../utils/mediaParts'
 import { parseToolCallsFromText } from '../utils/toolParser'
 import { 
   createToolCallState, 
@@ -573,6 +574,16 @@ export class MiniMaxAdapter {
     }
     
     const requestBody = this.messagesPrepare(messages, toolsPrompt, false)
+
+    // Web agent attachments API is undocumented here — inline text/small images into msg text.
+    const mediaFallback = await resolveMediaPromptAppendix(messages)
+    if (mediaFallback.errors.length) {
+      console.warn('[MiniMax] media resolve errors:', mediaFallback.errors.join('; '))
+    }
+    if (mediaFallback.appendix && typeof requestBody.text === 'string') {
+      console.log('[MiniMax] Inlining media into prompt appendix, count:', mediaFallback.count)
+      requestBody.text += mediaFallback.appendix
+    }
     
     let msgId: string = ''
     let chatId: string = request.chatId || ''

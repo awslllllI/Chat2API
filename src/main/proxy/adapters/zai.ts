@@ -7,7 +7,6 @@ import axios, { AxiosResponse } from 'axios'
 import crypto from 'crypto'
 import { PassThrough } from 'stream'
 import { createParser } from 'eventsource-parser'
-import FormData from 'form-data'
 import { Account, Provider } from '../../store/types'
 import { hasToolUse, parseToolUse, ToolCall } from '../promptToolUse'
 import { parseToolCallsFromText } from '../utils/toolParser'
@@ -18,6 +17,11 @@ import {
   createBaseChunk,
   ToolCallState 
 } from '../utils/streamToolHandler'
+import {
+  extractMediaParts,
+  inlineTextFilesAsPrompt,
+  resolveAllMedia,
+} from '../utils/mediaParts'
 
 const ZAI_API_BASE = 'https://chat.z.ai'
 const X_FE_VERSION = 'prod-fe-1.1.37'
@@ -424,6 +428,31 @@ export class ZaiAdapter {
       console.log('[Z.ai] Web search enabled (from model name)')
     }
 
+    // Keep OpenAI image_url parts for VLM models; inline text-file bytes into last user message.
+    const mediaParts = extractMediaParts(processedMessages as any)
+    const hasImages = mediaParts.some((p) => p.kind === 'image')
+    if (mediaParts.length) {
+      const { ok, errors } = await resolveAllMedia(mediaParts, { soft: true })
+      if (errors.length) console.warn('[Z.ai] media resolve errors:', errors.join('; '))
+      const fileAppendix = inlineTextFilesAsPrompt(ok.filter((m) => m.kind === 'file'))
+      if (fileAppendix) {
+        for (let i = processedMessages.length - 1; i >= 0; i--) {
+          if (processedMessages[i].role !== 'user') continue
+          const content = processedMessages[i].content
+          if (typeof content === 'string') {
+            processedMessages[i] = { ...processedMessages[i], content: content + fileAppendix }
+          } else if (Array.isArray(content)) {
+            processedMessages[i] = {
+              ...processedMessages[i],
+              content: [...content, { type: 'text', text: fileAppendix }],
+            }
+          }
+          break
+        }
+      }
+      console.log('[Z.ai] Media parts:', mediaParts.length, 'images:', hasImages)
+    }
+
     // Z.ai API uses auto_web_search for web search feature
     // web_search should always be false, use auto_web_search instead
     const features = {
@@ -432,7 +461,7 @@ export class ZaiAdapter {
       auto_web_search: enableWebSearch,
       preview_mode: true,
       flags: [],
-      vlm_tools_enable: false,
+      vlm_tools_enable: hasImages,
       vlm_web_search_enable: false,
       vlm_website_mode: false,
       enable_thinking: enableThinking,

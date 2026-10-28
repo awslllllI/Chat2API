@@ -5,12 +5,19 @@
 
 import axios from 'axios'
 import type { AxiosResponse } from 'axios'
+import { createHash } from 'crypto'
 import { PassThrough } from 'stream'
 import type { Account, Provider } from '../../store/types'
 import type { ChatMessage } from '../types.ts'
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser.ts'
 import type { ToolCallingPlan } from '../toolCalling/types.ts'
 import { getProviderToolProfile } from '../toolCalling/providerProfiles.ts'
+import {
+  extractMediaParts,
+  inlineTextFilesAsPrompt,
+  resolveAllMedia,
+  type ResolvedMediaBytes,
+} from '../utils/mediaParts'
 
 const MIMO_API_BASE = 'https://aistudio.xiaomimimo.com'
 
@@ -416,6 +423,109 @@ export class MimoAdapter {
     }
   }
 
+  /**
+   * Three-step MiMo upload: genUploadInfo → PUT → resource/parse.
+   */
+  private async uploadMediaToMimo(
+    media: ResolvedMediaBytes,
+    model: string,
+  ): Promise<Record<string, any> | null> {
+    const { serviceToken, userId, phToken } = this.getCredentials()
+    const md5 = createHash('md5').update(media.buffer).digest('hex')
+    const headers = this.buildHeaders(serviceToken, userId, phToken)
+
+    const infoRes = await axios.post(
+      this.buildUrl('/open-apis/resource/genUploadInfo', phToken),
+      { fileName: media.filename, fileContentMd5: md5 },
+      { headers, timeout: 30000, validateStatus: () => true },
+    )
+    if (infoRes.status !== 200 || infoRes.data?.code !== 0 || !infoRes.data?.data) {
+      console.error('[Mimo] genUploadInfo failed:', infoRes.status, infoRes.data)
+      return null
+    }
+
+    const { uploadUrl, resourceUrl, objectName } = infoRes.data.data
+    const putRes = await axios.put(uploadUrl, media.buffer, {
+      headers: { 'Content-Type': 'application/octet-stream' },
+      maxBodyLength: media.size + 1024,
+      timeout: 120000,
+      validateStatus: () => true,
+    })
+    if (putRes.status < 200 || putRes.status >= 300) {
+      console.error('[Mimo] PUT upload failed:', putRes.status)
+      return null
+    }
+
+    let parseData: any = null
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const parseRes = await axios.post(
+        `${MIMO_API_BASE}/open-apis/resource/parse`,
+        {},
+        {
+          params: {
+            fileUrl: resourceUrl,
+            objectName,
+            model,
+            xiaomichatbot_ph: phToken,
+          },
+          headers,
+          timeout: 30000,
+          validateStatus: () => true,
+        },
+      )
+      if (parseRes.status === 200 && parseRes.data?.code === 0 && parseRes.data?.data?.id) {
+        parseData = parseRes.data.data
+        break
+      }
+      await new Promise((r) => setTimeout(r, 1500))
+    }
+    if (!parseData?.id) {
+      console.error('[Mimo] resource/parse failed for', media.filename)
+      return null
+    }
+
+    const mediaType =
+      media.kind === 'video' ? 'video' : media.kind === 'audio' ? 'audio' : media.kind === 'image' ? 'image' : 'file'
+
+    return {
+      mediaType,
+      fileUrl: resourceUrl,
+      compressedVideoUrl: '',
+      audioTrackUrl: media.kind === 'audio' ? resourceUrl : '',
+      name: media.filename,
+      size: media.size,
+      status: 'completed',
+      objectName,
+      tokenUsage: parseData.tokenUsage || 0,
+      url: parseData.id,
+    }
+  }
+
+  /**
+   * Upload OpenAI media parts into MiMo multiMedias entries.
+   */
+  private async buildMultiMedias(
+    messages: MimoMessage[],
+    model: string,
+  ): Promise<{ multiMedias: Record<string, any>[]; promptAppendix: string }> {
+    const parts = extractMediaParts(messages)
+    if (!parts.length) return { multiMedias: [], promptAppendix: '' }
+
+    const { ok, errors } = await resolveAllMedia(parts, { soft: true })
+    if (errors.length) console.warn('[Mimo] media resolve errors:', errors.join('; '))
+
+    const multiMedias: Record<string, any>[] = []
+    for (const media of ok) {
+      const entry = await this.uploadMediaToMimo(media, model)
+      if (entry) multiMedias.push(entry)
+    }
+
+    const promptAppendix = multiMedias.length === 0
+      ? inlineTextFilesAsPrompt(ok.filter((m) => m.kind === 'file'))
+      : ''
+    return { multiMedias, promptAppendix }
+  }
+
   async chatCompletion(request: ChatCompletionRequest): Promise<{
     response: AxiosResponse
     conversationId: string
@@ -429,13 +539,18 @@ export class MimoAdapter {
 
     const conversationId = uuid(false)
     const msgId = uuid(false).slice(0, 32)
-    const query = buildMimoQuery(request.messages)
+    const { multiMedias, promptAppendix } = await this.buildMultiMedias(request.messages, request.model)
+    const query = buildMimoQuery(request.messages) + promptAppendix
     await this.saveConversation(conversationId)
 
     const modelLower = request.model.toLowerCase()
     let enableThinking = false
     if (modelLower.includes('think') || modelLower.includes('r1')) {
       enableThinking = true
+    }
+
+    if (multiMedias.length) {
+      console.log('[Mimo] Attaching multiMedias:', multiMedias.length)
     }
 
     const requestBody = {
@@ -450,7 +565,7 @@ export class MimoAdapter {
         temperature: request.temperature ?? 0.8,
         topP: 0.95,
       },
-      multiMedias: [],
+      multiMedias,
     }
 
     const response = await axios({

@@ -1,6 +1,7 @@
 import { net } from 'electron'
 import { Readable } from 'stream'
 import { Account, Provider } from '../store/types'
+import { resolveMediaPromptAppendix } from '../utils/mediaParts'
 
 const PERPLEXITY_URL = 'https://www.perplexity.ai'
 const QUERY_ENDPOINT = `${PERPLEXITY_URL}/rest/sse/perplexity_ask`
@@ -291,9 +292,19 @@ export class PerplexityAdapter {
   }
 
   async chatCompletion(request: ChatCompletionRequest): Promise<{ stream: Readable; sessionId: string }> {
-    const query = extractQuery(request.messages)
+    let query = extractQuery(request.messages)
     if (!query) {
       throw new Error('No user message found in request')
+    }
+
+    // Attachments endpoint is not wired; inline text/small images into the query string.
+    const mediaFallback = await resolveMediaPromptAppendix(request.messages as any)
+    if (mediaFallback.errors.length) {
+      console.warn('[Perplexity] media resolve errors:', mediaFallback.errors.join('; '))
+    }
+    if (mediaFallback.appendix) {
+      console.log('[Perplexity] Inlining media into query appendix, count:', mediaFallback.count)
+      query += mediaFallback.appendix
     }
 
     const model = mapModel(request.model)

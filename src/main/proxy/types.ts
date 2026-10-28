@@ -47,15 +47,31 @@ export type ChatCompletionToolChoice = 'none' | 'auto' | 'required' | {
 }
 
 /**
- * Message Content (supports multimodal)
+ * Message Content (supports multimodal text / image / file parts)
  */
 export interface ChatMessageContent {
-  type: 'text' | 'image_url'
+  type: 'text' | 'image_url' | 'file' | 'file_url' | 'input_audio' | 'video_url' | 'video' | 'image'
   text?: string
   image_url?: {
     url: string
     detail?: 'auto' | 'low' | 'high'
+  } | string
+  file_url?: {
+    url: string
   }
+  file?: {
+    url?: string
+    filename?: string
+    mime_type?: string
+    file_data?: string
+  }
+  input_audio?: {
+    data?: string
+    format?: string
+  }
+  video_url?: {
+    url: string
+  } | string
 }
 
 /**

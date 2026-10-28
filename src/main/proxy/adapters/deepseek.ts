@@ -7,12 +7,20 @@
  */
 
 import axios, { AxiosResponse } from 'axios'
+import FormData from 'form-data'
 import { getDeepSeekHash } from '../../lib/challenge'
 import type { Account, Provider } from '../../store/types'
 import { resolveDeepSeekChatOptions } from './providerModelOptions'
 import { getProviderToolProfile } from '../toolCalling/providerProfiles'
 import { accountGate } from '../accountGate'
 import { resolveAccountRateLimits } from '../rateLimitDefaults'
+import {
+  MEDIA_MAX_BYTES,
+  extractMediaParts,
+  inlineTextFilesAsPrompt,
+  resolveAllMedia,
+  type ResolvedMediaBytes,
+} from '../utils/mediaParts'
 
 const DEEPSEEK_API_BASE = 'https://chat.deepseek.com/api'
 
@@ -273,14 +281,20 @@ export class DeepSeekAdapter {
     return bizData.challenge
   }
 
-  private async calculateChallengeAnswer(challenge: ChallengeResponse): Promise<string> {
+  /**
+   * Encode PoW answer for a specific DeepSeek target_path.
+   */
+  private async calculateChallengeAnswer(
+    challenge: ChallengeResponse,
+    targetPath: string = '/api/v0/chat/completion',
+  ): Promise<string> {
     const { algorithm, challenge: challengeStr, salt, difficulty, expire_at, signature } = challenge
     
     if (algorithm !== 'DeepSeekHashV1') {
       throw new Error(`Unsupported algorithm: ${algorithm}`)
     }
     
-    console.log('[DeepSeek] Challenge parameters:', { difficulty })
+    console.log('[DeepSeek] Challenge parameters:', { difficulty, targetPath })
     
     const deepSeekHash = await getDeepSeekHash()
     const answer = deepSeekHash.calculateHash(algorithm, challengeStr, salt, difficulty, expire_at)
@@ -297,8 +311,107 @@ export class DeepSeekAdapter {
       salt,
       answer,
       signature,
-      target_path: '/api/v0/chat/completion',
+      target_path: targetPath,
     })).toString('base64')
+  }
+
+  /**
+   * Upload one file to DeepSeek and wait until parse SUCCESS.
+   */
+  private async uploadAndWaitFile(media: ResolvedMediaBytes): Promise<string> {
+    const token = await this.acquireToken()
+    const uploadPath = '/api/v0/file/upload_file'
+    const challenge = await this.getChallenge(uploadPath)
+    const pow = await this.calculateChallengeAnswer(challenge, uploadPath)
+
+    const form = new FormData()
+    form.append('file', media.buffer, {
+      filename: media.filename,
+      contentType: media.mimeType,
+    })
+
+    const uploadRes = await axios.post(
+      `${DEEPSEEK_API_BASE}/v0/file/upload_file`,
+      form,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          ...FAKE_HEADERS,
+          ...form.getHeaders(),
+          'X-Ds-Pow-Response': pow,
+          'X-File-Size': String(media.size),
+        },
+        maxBodyLength: MEDIA_MAX_BYTES,
+        timeout: 120000,
+        validateStatus: () => true,
+      },
+    )
+
+    const biz = uploadRes.data?.data?.biz_data || uploadRes.data?.biz_data
+    const fileId = biz?.id
+    if (uploadRes.status !== 200 || !fileId) {
+      throw new Error(`DeepSeek upload failed: HTTP ${uploadRes.status} ${JSON.stringify(uploadRes.data)?.slice(0, 200)}`)
+    }
+
+    console.log('[DeepSeek] Uploaded file', fileId, 'status=', biz.status)
+
+    const deadline = Date.now() + 90_000
+    while (Date.now() < deadline) {
+      const fetchRes = await axios.get(
+        `${DEEPSEEK_API_BASE}/v0/file/fetch_files`,
+        {
+          params: { file_ids: fileId },
+          headers: {
+            Authorization: `Bearer ${token}`,
+            ...FAKE_HEADERS,
+          },
+          timeout: 30000,
+          validateStatus: () => true,
+        },
+      )
+      const files = fetchRes.data?.data?.biz_data?.files || fetchRes.data?.biz_data?.files || []
+      const entry = Array.isArray(files) ? files.find((f: any) => f.id === fileId) || files[0] : null
+      const status = entry?.status
+      if (status === 'SUCCESS') {
+        console.log('[DeepSeek] File parse SUCCESS', fileId)
+        return fileId
+      }
+      if (status === 'FAILED') {
+        throw new Error(`DeepSeek file parse failed: ${entry?.error_code || 'FAILED'}`)
+      }
+      await new Promise((r) => setTimeout(r, 1500))
+    }
+    throw new Error(`DeepSeek file parse timeout: ${fileId}`)
+  }
+
+  /**
+   * Upload OpenAI message media parts; returns ref_file_ids for chat.
+   */
+  private async uploadMessageMedia(messages: any[]): Promise<{ refFileIds: string[]; promptAppendix: string }> {
+    const parts = extractMediaParts(messages)
+    if (parts.length === 0) return { refFileIds: [], promptAppendix: '' }
+
+    const { ok, errors } = await resolveAllMedia(parts, { soft: true })
+    if (errors.length) {
+      console.warn('[DeepSeek] Some media failed to resolve:', errors.join('; '))
+    }
+
+    const refFileIds: string[] = []
+    const textLike = ok.filter((m) => m.kind === 'file')
+    const uploadable = ok.filter((m) => m.kind === 'image' || m.kind === 'file' || m.kind === 'audio' || m.kind === 'video')
+
+    for (const media of uploadable) {
+      try {
+        const id = await this.uploadAndWaitFile(media)
+        refFileIds.push(id)
+      } catch (err) {
+        console.error('[DeepSeek] Upload failed for', media.filename, err)
+      }
+    }
+
+    // Fallback: if nothing uploaded, still inline small text files into prompt
+    const promptAppendix = refFileIds.length === 0 ? inlineTextFilesAsPrompt(textLike) : ''
+    return { refFileIds, promptAppendix }
   }
 
   private messagesToPrompt(messages: DeepSeekMessage[], isMultiTurn: boolean = false): string {
@@ -392,17 +505,24 @@ export class DeepSeekAdapter {
     
     const sessionId = await this.createSession()
     console.log('[DeepSeek] Created new session:', sessionId)
-    
-    const challenge = await this.getChallenge('/api/v0/chat/completion')
-    const challengeAnswer = await this.calculateChallengeAnswer(challenge)
 
     // Clone messages to avoid modifying original request
     // Note: Tool prompt injection is already handled by Forwarder.transformRequestForPromptToolUse()
     const messages = [...request.messages]
 
-    let prompt = this.messagesToPrompt(messages, false)
+    const { refFileIds, promptAppendix } = await this.uploadMessageMedia(messages)
+    let prompt = this.messagesToPrompt(messages, false) + promptAppendix
 
-    const { modelType, searchEnabled, thinkingEnabled } = resolveDeepSeekChatOptions(request, prompt)
+    let { modelType, searchEnabled, thinkingEnabled } = resolveDeepSeekChatOptions(request, prompt)
+    // Expert / pro mode rejects file uploads — fall back to fast mode when refs present
+    if (refFileIds.length > 0 && modelType === 'expert') {
+      console.warn('[DeepSeek] Files present — downgrading expert → default for upload support')
+      modelType = 'default'
+    }
+
+    const challengePath = '/api/v0/chat/completion'
+    const challenge = await this.getChallenge(challengePath)
+    const challengeAnswer = await this.calculateChallengeAnswer(challenge, challengePath)
 
     if (request.web_search || request.model.toLowerCase().includes('search')) {
       console.log('[DeepSeek] Web search enabled')
@@ -412,6 +532,10 @@ export class DeepSeekAdapter {
       console.log('[DeepSeek] Reasoning mode enabled, effort:', request.reasoning_effort)
     }
 
+    if (refFileIds.length) {
+      console.log('[DeepSeek] Attaching files:', refFileIds.join(', '))
+    }
+
     const response = await axios.post(
       `${DEEPSEEK_API_BASE}/v0/chat/completion`,
       {
@@ -419,7 +543,7 @@ export class DeepSeekAdapter {
         parent_message_id: null,
         prompt,
         model_type: modelType,
-        ref_file_ids: [],
+        ref_file_ids: refFileIds,
         search_enabled: searchEnabled,
         thinking_enabled: thinkingEnabled,
         preempt: false,

@@ -10,8 +10,6 @@ import { storeManager } from '../../store/store'
 import { PassThrough } from 'stream'
 import { createParser } from 'eventsource-parser'
 import FormData from 'form-data'
-import mime from 'mime-types'
-import path from 'path'
 import { toolsToSystemPrompt, hasToolPromptInjected } from '../utils/tools'
 import { parseToolCallsFromText } from '../utils/toolParser'
 import { 
@@ -20,6 +18,11 @@ import {
 import { getProviderToolProfile } from '../toolCalling/providerProfiles'
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
 import type { ToolCallingPlan } from '../toolCalling/types'
+import {
+  extractMediaParts,
+  resolveAllMedia,
+  type ResolvedMediaBytes,
+} from '../utils/mediaParts'
 
 const GLM_API_BASE = 'https://chatglm.cn/chatglm'
 const DEFAULT_ASSISTANT_ID = '65940acff94777010aa6b796'
@@ -223,57 +226,15 @@ export class GLMAdapter {
   }
 
   /**
-   * Check if URL is base64 data
+   * Upload resolved media bytes to GLM multipart endpoint.
    */
-  private isBase64Data(url: string): boolean {
-    return url.startsWith('data:')
-  }
-
-  /**
-   * Extract MIME type from base64 data URL
-   */
-  private extractBase64Format(url: string): string {
-    const match = url.match(/^data:([^;]+);/)
-    return match ? match[1] : 'application/octet-stream'
-  }
-
-  /**
-   * Remove base64 data header
-   */
-  private removeBase64Header(url: string): string {
-    return url.replace(/^data:[^;]+;base64,/, '')
-  }
-
-  /**
-   * Upload file to GLM
-   */
-  private async uploadFile(fileUrl: string): Promise<{ source_id: string; file_url?: string }> {
-    console.log('[GLM] Uploading file:', fileUrl.substring(0, 50) + '...')
-    
-    let filename: string
-    let fileData: Buffer
-    let mimeType: string
-
-    if (this.isBase64Data(fileUrl)) {
-      mimeType = this.extractBase64Format(fileUrl)
-      const ext = mime.extension(mimeType) || 'bin'
-      filename = `${uuid()}.${ext}`
-      fileData = Buffer.from(this.removeBase64Header(fileUrl), 'base64')
-    } else {
-      filename = path.basename(fileUrl.split('?')[0])
-      const response = await axios.get(fileUrl, {
-        responseType: 'arraybuffer',
-        maxContentLength: FILE_MAX_SIZE,
-        timeout: 60000,
-      })
-      fileData = Buffer.from(response.data)
-      mimeType = response.headers['content-type'] || mime.lookup(filename) || 'application/octet-stream'
-    }
+  private async uploadResolvedMedia(media: ResolvedMediaBytes): Promise<{ source_id: string; file_url?: string }> {
+    console.log('[GLM] Uploading file:', media.filename, media.size)
 
     const formData = new FormData()
-    formData.append('file', fileData, {
-      filename,
-      contentType: mimeType,
+    formData.append('file', media.buffer, {
+      filename: media.filename,
+      contentType: media.mimeType,
     })
 
     const token = await this.acquireToken()
@@ -302,25 +263,37 @@ export class GLMAdapter {
   }
 
   /**
-   * Extract file URLs from message content
+   * Upload OpenAI media parts via shared mediaParts helpers.
    */
-  private extractFileUrls(messages: GLMMessage[]): { fileUrls: string[]; imageUrls: string[] } {
-    const fileUrls: string[] = []
-    const imageUrls: string[] = []
+  private async uploadMessageMedia(messages: GLMMessage[]): Promise<any[]> {
+    const parts = extractMediaParts(messages)
+    if (!parts.length) return []
 
-    for (const msg of messages) {
-      if (Array.isArray(msg.content)) {
-        for (const part of msg.content) {
-          if (part.type === 'image_url' && part.image_url?.url) {
-            imageUrls.push(part.image_url.url)
-          } else if (part.type === 'file' && part.file_url?.url) {
-            fileUrls.push(part.file_url.url)
-          }
+    const { ok, errors } = await resolveAllMedia(parts, { soft: true, maxBytes: FILE_MAX_SIZE })
+    if (errors.length) console.warn('[GLM] media resolve errors:', errors.join('; '))
+
+    const refs: any[] = []
+    for (const media of ok) {
+      try {
+        const result = await this.uploadResolvedMedia(media)
+        if (media.kind === 'image') {
+          refs.push({
+            source_id: result.source_id,
+            image_url: result.file_url || media.sourceUrl,
+            width: 0,
+            height: 0,
+          })
+        } else {
+          refs.push({
+            source_id: result.source_id,
+            file_url: result.file_url || media.sourceUrl,
+          })
         }
+      } catch (error) {
+        console.error('[GLM] Failed to upload media:', media.filename, error)
       }
     }
-
-    return { fileUrls, imageUrls }
+    return refs
   }
 
   private messagesToPrompt(messages: GLMMessage[], refs: any[] = [], toolsPrompt?: string, isMultiTurn: boolean = false): { role: string; content: any[] }[] {
@@ -479,36 +452,9 @@ export class GLMAdapter {
       toolsPrompt = toolsToSystemPrompt(request.tools)
     }
 
-    // Extract and upload files
-    const { fileUrls, imageUrls } = this.extractFileUrls(messages)
-    const refs: any[] = []
-
-    // Upload files
-    for (const fileUrl of fileUrls) {
-      try {
-        const result = await this.uploadFile(fileUrl)
-        refs.push({
-          source_id: result.source_id,
-          file_url: result.file_url || fileUrl,
-        })
-      } catch (error) {
-        console.error('[GLM] Failed to upload file:', error)
-      }
-    }
-
-    // Upload images
-    for (const imageUrl of imageUrls) {
-      try {
-        const result = await this.uploadFile(imageUrl)
-        refs.push({
-          source_id: result.source_id,
-          image_url: result.file_url || imageUrl,
-          width: 0,
-          height: 0,
-        })
-      } catch (error) {
-        console.error('[GLM] Failed to upload image:', error)
-      }
+    const refs = await this.uploadMessageMedia(messages)
+    if (refs.length) {
+      console.log('[GLM] Attached media refs:', refs.length)
     }
 
     const preparedMessages = this.messagesToPrompt(messages, refs, toolsPrompt, false)

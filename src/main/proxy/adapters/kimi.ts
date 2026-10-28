@@ -21,6 +21,7 @@ import {
   pickKimiCredentials,
   refreshKimiWebTokens,
 } from './kimi-auth'
+import { resolveMediaPromptAppendix } from '../utils/mediaParts'
 
 const KIMI_API_BASE = 'https://www.kimi.com'
 
@@ -369,7 +370,18 @@ export class KimiAdapter {
       }
     }
 
-    const content = this.messagesPrepare(messages, toolsPrompt, false)
+    let content = this.messagesPrepare(messages, toolsPrompt, false)
+
+    // Best-effort media: Connect chat API has no public pre-sign surface yet —
+    // inline text files / small images into the prompt so multimodal clients still work.
+    const mediaFallback = await resolveMediaPromptAppendix(messages)
+    if (mediaFallback.errors.length) {
+      console.warn('[Kimi] media resolve errors:', mediaFallback.errors.join('; '))
+    }
+    if (mediaFallback.appendix) {
+      console.log('[Kimi] Inlining media into prompt appendix, count:', mediaFallback.count)
+      content += mediaFallback.appendix
+    }
 
     // Determine if thinking and web search should be enabled
     // Priority: explicit parameters > model name detection

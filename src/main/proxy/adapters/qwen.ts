@@ -18,6 +18,7 @@ import { getProviderToolProfile } from '../toolCalling/providerProfiles'
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
 import { parseToolContentWithFallback } from '../toolCalling/parseFallback'
 import type { ToolCallingPlan } from '../toolCalling/types'
+import { resolveMediaPromptAppendix } from '../utils/mediaParts'
 
 /**
  * Check if content contains tool calls (both bracket and XML formats)
@@ -374,6 +375,17 @@ export class QwenAdapter {
         : toolsPrompt
       // Add tool wrap hint to user content
       userContent = userContent + TOOL_WRAP_HINT
+    }
+
+    // Domestic chat2 API currently has no stable public upload surface in-repo —
+    // inline text/small images so OpenAI multimodal clients still deliver content.
+    const mediaFallback = await resolveMediaPromptAppendix(request.messages)
+    if (mediaFallback.errors.length) {
+      console.warn('[Qwen] media resolve errors:', mediaFallback.errors.join('; '))
+    }
+    if (mediaFallback.appendix) {
+      console.log('[Qwen] Inlining media into prompt appendix, count:', mediaFallback.count)
+      userContent += mediaFallback.appendix
     }
 
     // If system prompt exists, prepend it to user content
