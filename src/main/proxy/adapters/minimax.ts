@@ -12,7 +12,13 @@ import { createParser, EventSourceMessage } from 'eventsource-parser'
 import FormData from 'form-data'
 import { Account, Provider } from '../../store/types'
 import { toolsToSystemPrompt, TOOL_WRAP_HINT, hasToolPromptInjected, shouldInjectToolPrompt } from '../utils/tools'
-import { resolveMediaPromptAppendix } from '../utils/mediaParts'
+import {
+  extractMediaParts,
+  extractTextFromContent,
+  inlineTextFilesAsPrompt,
+  resolveAllMedia,
+} from '../utils/mediaParts'
+import type { MiniMaxAttachment } from './minimax-upload'
 import { parseToolCallsFromText } from '../utils/toolParser'
 import { 
   createToolCallState, 
@@ -496,7 +502,7 @@ export class MiniMaxAdapter {
           msg_type: 1,
           text: content,
           chat_type: 1,
-          attachments: [],
+          attachments: [] as MiniMaxAttachment[],
           selected_mcp_tools: [],
           backend_config: {},
           sub_agent_ids: [],
@@ -506,13 +512,13 @@ export class MiniMaxAdapter {
     
     if (otherMessages.length < 2) {
       content += otherMessages.reduce((acc, msg) => {
-        const text = typeof msg.content === 'string' ? msg.content : ''
+        const text = extractTextFromContent(msg.content)
         return acc + `${msg.role}:${text}\n`
       }, '')
     } else {
       const latestMessage = otherMessages[otherMessages.length - 1]
       const hasFileOrImage = Array.isArray(latestMessage.content) &&
-        latestMessage.content.some((v: any) => typeof v === 'object' && ['file', 'image_url'].includes(v.type))
+        latestMessage.content.some((v: any) => typeof v === 'object' && ['file', 'image_url', 'image'].includes(v.type))
       
       if (hasFileOrImage) {
         const newFileMessage: MiniMaxMessage = {
@@ -523,7 +529,7 @@ export class MiniMaxAdapter {
       }
       
       content += otherMessages.reduce((acc, msg) => {
-        const text = typeof msg.content === 'string' ? msg.content : ''
+        const text = extractTextFromContent(msg.content)
         return acc + `${msg.role}:${text}\n`
       }, '') + 'assistant:\n'
       
@@ -539,10 +545,121 @@ export class MiniMaxAdapter {
       msg_type: 1,
       text: content,
       chat_type: 1,
-      attachments: [],
+      attachments: [] as MiniMaxAttachment[],
       selected_mcp_tools: [],
       backend_config: {},
       sub_agent_ids: [],
+    }
+  }
+
+  /**
+   * Upload one media via prepare (signed like matrix requests) → OSS form POST.
+   */
+  private async uploadOneAttachment(
+    media: ResolvedMediaBytes,
+    deviceInfo: DeviceInfo,
+  ): Promise<MiniMaxAttachment> {
+    const mimeType = (media.mimeType || 'application/octet-stream').split(';')[0].trim().toLowerCase()
+    const prepareBody = {
+      purpose: 1, // MessageAttachment
+      file_name: media.filename || 'upload.bin',
+      mime_type: mimeType,
+      size_bytes: media.size,
+    }
+
+    // 复用已验证的 matrix 签名链路，避免 uploads/prepare 自定义签名不一致
+    const prepareRes = await this.request(
+      'POST',
+      '/minimax-cloud/api/v1/uploads/prepare',
+      prepareBody,
+      deviceInfo,
+    )
+    const raw = prepareRes.data
+    const payload = raw?.object_key ? raw : raw?.data ?? raw
+    const statusCode =
+      payload?.base_resp?.status_code ??
+      payload?.statusInfo?.code ??
+      (prepareRes.status === 200 ? 0 : prepareRes.status)
+    if (statusCode !== 0) {
+      throw new Error(
+        `上传预签名失败: ${payload?.base_resp?.status_msg || payload?.statusInfo?.message || JSON.stringify(raw)?.slice(0, 200)}`,
+      )
+    }
+
+    const objectKey = String(payload.object_key || '').trim()
+    const instruction = payload.upload_instruction || payload.uploadInstruction
+    const uploadUrl = String(instruction?.url || '').trim()
+    const formFields = instruction?.form_fields || instruction?.formFields
+    if (!objectKey || !uploadUrl || !formFields || typeof formFields !== 'object') {
+      throw new Error('上传预签名返回缺少对象键或表单字段')
+    }
+
+    const form = new FormData()
+    for (const [key, value] of Object.entries(formFields as Record<string, string>)) {
+      form.append(key, String(value))
+    }
+    form.append('file', media.buffer, {
+      filename: media.filename || 'upload.bin',
+      contentType: mimeType,
+    })
+    const putRes = await axios.post(uploadUrl, form, {
+      headers: form.getHeaders(),
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+      timeout: 600_000,
+      validateStatus: () => true,
+      maxRedirects: 0,
+    })
+    if (putRes.status !== 204 && (putRes.status < 200 || putRes.status >= 300)) {
+      throw new Error(`对象存储上传失败: HTTP ${putRes.status}`)
+    }
+
+    return {
+      attachment_type: media.kind === 'image' ? 1 : 2,
+      file: {
+        object_key: objectKey,
+        file_name: media.filename,
+      },
+    }
+  }
+
+  /**
+   * Upload OpenAI media via MiniMax web OSS prepare path (MessageAttachment).
+   */
+  private async uploadMessageMedia(
+    messages: MiniMaxMessage[],
+    deviceInfo: DeviceInfo,
+  ): Promise<{ attachments: MiniMaxAttachment[]; promptAppendix: string }> {
+    const parts = extractMediaParts(messages as any)
+    if (!parts.length) return { attachments: [], promptAppendix: '' }
+
+    const { ok, errors } = await resolveAllMedia(parts, { soft: true })
+    if (errors.length) console.warn('[MiniMax] 媒体解析失败:', errors.join('; '))
+    if (!ok.length) return { attachments: [], promptAppendix: '' }
+
+    const attachments: MiniMaxAttachment[] = []
+    const failed: typeof ok = []
+    for (const media of ok) {
+      try {
+        const att = await this.uploadOneAttachment(media, deviceInfo)
+        attachments.push(att)
+        console.log('[MiniMax] 已上传', media.filename, '→', att.file.object_key)
+      } catch (err) {
+        console.error('[MiniMax] 上传失败', media.filename, err instanceof Error ? err.message : err)
+        failed.push(media)
+      }
+    }
+
+    const imageFailed = failed.filter((m) => m.kind === 'image')
+    if (imageFailed.length && attachments.length === 0) {
+      throw new Error(
+        `图片上传失败（${imageFailed.map((m) => m.filename).join(', ')}），拒绝改用内联图片`,
+      )
+    }
+
+    return {
+      attachments,
+      promptAppendix: inlineTextFilesAsPrompt(failed.filter((m) => m.kind === 'file')),
     }
   }
 
@@ -575,14 +692,11 @@ export class MiniMaxAdapter {
     
     const requestBody = this.messagesPrepare(messages, toolsPrompt, false)
 
-    // Web agent attachments API is undocumented here — inline text/small images into msg text.
-    const mediaFallback = await resolveMediaPromptAppendix(messages)
-    if (mediaFallback.errors.length) {
-      console.warn('[MiniMax] media resolve errors:', mediaFallback.errors.join('; '))
-    }
-    if (mediaFallback.appendix && typeof requestBody.text === 'string') {
-      console.log('[MiniMax] Inlining media into prompt appendix, count:', mediaFallback.count)
-      requestBody.text += mediaFallback.appendix
+    // Native web upload → attachments[] (object_key), matching agent.minimaxi.com
+    const uploaded = await this.uploadMessageMedia(messages, deviceInfo)
+    requestBody.attachments = uploaded.attachments
+    if (uploaded.promptAppendix && typeof requestBody.text === 'string') {
+      requestBody.text += uploaded.promptAppendix
     }
     
     let msgId: string = ''

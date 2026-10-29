@@ -440,7 +440,7 @@ export class MimoAdapter {
       { headers, timeout: 30000, validateStatus: () => true },
     )
     if (infoRes.status !== 200 || infoRes.data?.code !== 0 || !infoRes.data?.data) {
-      console.error('[Mimo] genUploadInfo failed:', infoRes.status, infoRes.data)
+      console.error('[Mimo] 申请上传信息失败:', infoRes.status, infoRes.data)
       return null
     }
 
@@ -452,7 +452,7 @@ export class MimoAdapter {
       validateStatus: () => true,
     })
     if (putRes.status < 200 || putRes.status >= 300) {
-      console.error('[Mimo] PUT upload failed:', putRes.status)
+      console.error('[Mimo] 二进制上传失败:', putRes.status)
       return null
     }
 
@@ -480,7 +480,7 @@ export class MimoAdapter {
       await new Promise((r) => setTimeout(r, 1500))
     }
     if (!parseData?.id) {
-      console.error('[Mimo] resource/parse failed for', media.filename)
+      console.error('[Mimo] 资源解析失败', media.filename)
       return null
     }
 
@@ -512,7 +512,7 @@ export class MimoAdapter {
     if (!parts.length) return { multiMedias: [], promptAppendix: '' }
 
     const { ok, errors } = await resolveAllMedia(parts, { soft: true })
-    if (errors.length) console.warn('[Mimo] media resolve errors:', errors.join('; '))
+    if (errors.length) console.warn('[Mimo] 媒体解析失败:', errors.join('; '))
 
     const multiMedias: Record<string, any>[] = []
     for (const media of ok) {
@@ -550,7 +550,7 @@ export class MimoAdapter {
     }
 
     if (multiMedias.length) {
-      console.log('[Mimo] Attaching multiMedias:', multiMedias.length)
+      console.log('[Mimo] 附加多媒体:', multiMedias.length)
     }
 
     const requestBody = {

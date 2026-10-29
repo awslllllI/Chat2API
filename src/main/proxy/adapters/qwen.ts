@@ -5,6 +5,7 @@
  */
 
 import axios, { AxiosResponse } from 'axios'
+import { createHmac, randomUUID } from 'crypto'
 import { PassThrough } from 'stream'
 import { createGunzip, createInflate, createBrotliDecompress } from 'zlib'
 import * as ZstdCodec from 'zstd-codec'
@@ -18,7 +19,44 @@ import { getProviderToolProfile } from '../toolCalling/providerProfiles'
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
 import { parseToolContentWithFallback } from '../toolCalling/parseFallback'
 import type { ToolCallingPlan } from '../toolCalling/types'
-import { resolveMediaPromptAppendix } from '../utils/mediaParts'
+import {
+  extractMediaParts,
+  inlineTextFilesAsPrompt,
+  resolveAllMedia,
+  type ResolvedMediaBytes,
+} from '../utils/mediaParts'
+
+/** STS credentials from chat2 getstsToken */
+interface QwenStsToken {
+  access_key_id: string
+  access_key_secret: string
+  security_token: string
+  bucketname: string
+  endpoint: string
+  file_id: string
+  file_path: string
+  file_url: string
+}
+
+/** Attachment object matching Qwen web UI messages[].files[] */
+interface QwenFileAttachment {
+  type: string
+  file: Record<string, any>
+  id: string
+  url: string
+  name: string
+  collection_name: string
+  progress: number
+  status: string
+  greenNet: string
+  size: number
+  error: string
+  itemId: string
+  file_type: string
+  showType: string
+  file_class: string
+  uploadTaskId: string
+}
 
 /**
  * Check if content contains tool calls (both bracket and XML formats)
@@ -65,6 +103,8 @@ interface QwenMessage {
 
 interface ChatCompletionRequest {
   model: string
+  /** Client model name before mapping */
+  originalModel?: string
   messages: QwenMessage[]
   tools?: any[]
   stream?: boolean
@@ -289,6 +329,220 @@ export class QwenAdapter {
     return true
   }
 
+  /**
+   * Request temporary OSS credentials for chat2 file upload.
+   */
+  private async getStsToken(
+    ticket: string,
+    filename: string,
+    filesize: number,
+    filetype: 'file' | 'image',
+  ): Promise<QwenStsToken> {
+    // chat2 页面域名与 chat2-api 网关都可能承载该接口，依次尝试
+    const endpoints = [
+      `${QWEN_CHAT2_API_BASE}/api/v2/files/getstsToken`,
+      `${QWEN_API_BASE}/api/v2/files/getstsToken`,
+      `${QWEN_CHAT_SIDE_API_BASE}/api/v2/files/getstsToken`,
+    ]
+    let lastErr = ''
+    for (const url of endpoints) {
+      const response = await axios.post(
+        url,
+        { filename, filesize: String(filesize), filetype },
+        {
+          headers: this.getApiHeaders(ticket),
+          params: this.getApiParams(),
+          timeout: 30000,
+          validateStatus: () => true,
+        },
+      )
+      if (response.status === 200 && response.data?.data) {
+        return response.data.data as QwenStsToken
+      }
+      lastErr = `HTTP ${response.status} ${JSON.stringify(response.data)?.slice(0, 160)} @ ${url}`
+      console.warn('[Qwen] 申请临时凭证未成功，尝试下一地址:', lastErr)
+    }
+    throw new Error(`申请临时凭证失败: ${lastErr}`)
+  }
+
+  /**
+   * PUT file bytes to Alibaba OSS using STS credentials.
+   */
+  private async uploadToOss(sts: QwenStsToken, buffer: Buffer, contentType: string): Promise<void> {
+    const date = new Date().toUTCString()
+    let objectKey = sts.file_path
+    const bucketPrefix = `${sts.bucketname}/`
+    if (objectKey.startsWith(bucketPrefix)) {
+      objectKey = objectKey.slice(bucketPrefix.length)
+    }
+
+    const canonical = [
+      'PUT',
+      '',
+      contentType,
+      date,
+      `x-oss-security-token:${sts.security_token}`,
+      `/${sts.bucketname}/${objectKey}`,
+    ].join('\n')
+    const signature = createHmac('sha1', sts.access_key_secret).update(canonical).digest('base64')
+
+    let endpoint = (sts.endpoint || '').replace(/\/+$/, '')
+    if (!endpoint.includes(sts.bucketname)) {
+      endpoint = `https://${sts.bucketname}.${endpoint.replace(/^https?:\/\//, '')}`
+    }
+
+    const putRes = await axios.put(`${endpoint}/${objectKey}`, buffer, {
+      headers: {
+        'Content-Type': contentType,
+        Date: date,
+        Authorization: `OSS ${sts.access_key_id}:${signature}`,
+        'x-oss-security-token': sts.security_token,
+      },
+      maxBodyLength: buffer.length + 1024,
+      timeout: 120000,
+      validateStatus: () => true,
+    })
+    if (putRes.status < 200 || putRes.status >= 300) {
+      throw new Error(`Qwen OSS upload failed: HTTP ${putRes.status}`)
+    }
+  }
+
+  /**
+   * Trigger and poll server-side document parse.
+   */
+  private async parseUploadedFile(ticket: string, fileId: string): Promise<void> {
+    await axios.post(
+      `${QWEN_API_BASE}/api/v2/files/parse`,
+      { file_id: fileId },
+      {
+        headers: this.getApiHeaders(ticket),
+        params: this.getApiParams(),
+        timeout: 30000,
+        validateStatus: () => true,
+      },
+    )
+
+    const deadline = Date.now() + 15000
+    while (Date.now() < deadline) {
+      const statusRes = await axios.post(
+        `${QWEN_API_BASE}/api/v2/files/parse/status`,
+        { file_id_list: [fileId] },
+        {
+          headers: this.getApiHeaders(ticket),
+          params: this.getApiParams(),
+          timeout: 15000,
+          validateStatus: () => true,
+        },
+      )
+      const status = statusRes.data?.data?.[0]?.status || statusRes.data?.status || ''
+      if (status === 'success') return
+      if (status === 'failed') throw new Error(`Qwen file parse failed for ${fileId}`)
+      await new Promise((r) => setTimeout(r, 1000))
+    }
+    console.warn('[Qwen] Parse poll timed out for', fileId)
+  }
+
+  /**
+   * Build Qwen web UI file attachment object from STS result.
+   */
+  private buildFileAttachment(
+    sts: QwenStsToken,
+    media: ResolvedMediaBytes,
+    attachmentType: 'file' | 'image',
+  ): QwenFileAttachment {
+    const userId = sts.file_path.split('/')[0] || ''
+    const now = Date.now()
+    const meta: Record<string, any> = {
+      name: media.filename,
+      size: media.size,
+      content_type: media.mimeType,
+    }
+    if (attachmentType === 'file') {
+      meta.parse_meta = { parse_status: 'success' }
+    }
+
+    return {
+      type: attachmentType,
+      file: {
+        created_at: now,
+        data: {},
+        filename: media.filename,
+        hash: null,
+        id: sts.file_id,
+        user_id: userId,
+        meta,
+        update_at: now,
+        lastModified: now,
+        name: media.filename,
+        webkitRelativePath: '',
+        size: media.size,
+        type: media.mimeType,
+      },
+      id: sts.file_id,
+      url: sts.file_url,
+      name: media.filename,
+      collection_name: '',
+      progress: 0,
+      status: 'uploaded',
+      greenNet: 'success',
+      size: media.size,
+      error: '',
+      itemId: randomUUID(),
+      file_type: media.mimeType,
+      showType: attachmentType === 'image' ? 'image' : 'file',
+      file_class: attachmentType === 'image' ? 'vision' : 'document',
+      uploadTaskId: randomUUID(),
+    }
+  }
+
+  /**
+   * Upload OpenAI media parts via chat2 STS/OSS; refuse image base64 fallback.
+   */
+  private async uploadMessageMedia(
+    messages: QwenMessage[],
+    ticket: string,
+  ): Promise<{ files: QwenFileAttachment[]; promptAppendix: string }> {
+    const parts = extractMediaParts(messages as any)
+    if (!parts.length) return { files: [], promptAppendix: '' }
+
+    const { ok, errors } = await resolveAllMedia(parts, { soft: true })
+    if (errors.length) console.warn('[Qwen] 媒体解析失败:', errors.join('; '))
+
+    const files: QwenFileAttachment[] = []
+    const failed: ResolvedMediaBytes[] = []
+    for (const media of ok) {
+      if (media.kind === 'audio' || media.kind === 'video') {
+        console.warn('[Qwen] 跳过不支持的媒体类型:', media.kind, media.filename)
+        continue
+      }
+      const attachmentType: 'file' | 'image' = media.kind === 'image' ? 'image' : 'file'
+      try {
+        const sts = await this.getStsToken(ticket, media.filename, media.size, attachmentType)
+        await this.uploadToOss(sts, media.buffer, media.mimeType)
+        if (attachmentType === 'file') {
+          await this.parseUploadedFile(ticket, sts.file_id)
+        }
+        files.push(this.buildFileAttachment(sts, media, attachmentType))
+        console.log('[Qwen] 已上传', media.filename, '→', sts.file_id)
+      } catch (err) {
+        console.error('[Qwen] 上传失败', media.filename, err instanceof Error ? err.message : err)
+        failed.push(media)
+      }
+    }
+
+    const imageFailed = failed.filter((m) => m.kind === 'image')
+    if (imageFailed.length && files.length === 0) {
+      throw new Error(
+        `图片上传失败（${imageFailed.map((m) => m.filename).join(', ')}），拒绝改用内联图片`,
+      )
+    }
+
+    return {
+      files,
+      promptAppendix: inlineTextFilesAsPrompt(failed.filter((m) => m.kind === 'file')),
+    }
+  }
+
   async chatCompletion(request: ChatCompletionRequest): Promise<{
     response: AxiosResponse
     sessionId: string
@@ -310,10 +564,16 @@ export class QwenAdapter {
     const modelForDetection = request.originalModel || request.model
     const modelLower = modelForDetection.toLowerCase()
     
-    let enableThinking = request.enableThinking ?? false
-    let enableWebSearch = request.enableWebSearch ?? false
-    
-    // Auto-enable based on model name (if not explicitly set)
+    // Prefer OpenAI-style flags (web_search / reasoning_effort) then provider aliases, then model name.
+    let enableThinking =
+      request.enableThinking === true ||
+      Boolean(request.reasoning_effort) ||
+      false
+    let enableWebSearch =
+      request.enableWebSearch === true ||
+      request.web_search === true ||
+      false
+
     if (!enableThinking && (modelLower.includes('think') || modelLower.includes('r1'))) {
       enableThinking = true
       console.log('[Qwen] Thinking mode enabled (from model name)')
@@ -321,6 +581,12 @@ export class QwenAdapter {
     if (!enableWebSearch && modelLower.includes('search')) {
       enableWebSearch = true
       console.log('[Qwen] Web search enabled (from model name)')
+    }
+    if (request.enableThinking === false) {
+      enableThinking = false
+    }
+    if (request.enableWebSearch === false || request.web_search === false) {
+      enableWebSearch = false
     }
 
     // Map thinking mode to model
@@ -377,15 +643,11 @@ export class QwenAdapter {
       userContent = userContent + TOOL_WRAP_HINT
     }
 
-    // Domestic chat2 API currently has no stable public upload surface in-repo —
-    // inline text/small images so OpenAI multimodal clients still deliver content.
-    const mediaFallback = await resolveMediaPromptAppendix(request.messages)
-    if (mediaFallback.errors.length) {
-      console.warn('[Qwen] media resolve errors:', mediaFallback.errors.join('; '))
-    }
-    if (mediaFallback.appendix) {
-      console.log('[Qwen] Inlining media into prompt appendix, count:', mediaFallback.count)
-      userContent += mediaFallback.appendix
+    // Native chat2 upload: getstsToken → OSS PUT → parse → messages[].files
+    const { files, promptAppendix } = await this.uploadMessageMedia(request.messages, ticket)
+    if (promptAppendix) userContent += promptAppendix
+    if (files.length) {
+      console.log('[Qwen] 附加文件:', files.map((f) => f.id).join(', '))
     }
 
     // If system prompt exists, prepend it to user content
@@ -395,6 +657,7 @@ export class QwenAdapter {
 
     const timestamp = Date.now()
     const nonce = generateNonce()
+    const hasImage = files.some((f) => f.type === 'image')
 
     const requestBody = {
       deep_search: (enableWebSearch || enableThinking) ? '1' : '0',
@@ -407,7 +670,8 @@ export class QwenAdapter {
       messages: [
         {
           content: finalContent,
-          mime_type: 'text/plain',
+          mime_type: hasImage ? 'image/url' : 'text/plain',
+          files,
           meta_data: {
             ori_query: finalContent
           }

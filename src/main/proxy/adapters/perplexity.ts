@@ -1,7 +1,12 @@
 import { net } from 'electron'
 import { Readable } from 'stream'
 import { Account, Provider } from '../store/types'
-import { resolveMediaPromptAppendix } from '../utils/mediaParts'
+import {
+  extractMediaParts,
+  inlineTextFilesAsPrompt,
+  resolveAllMedia,
+} from '../utils/mediaParts'
+import { uploadPerplexityAttachment } from './perplexity-upload'
 
 const PERPLEXITY_URL = 'https://www.perplexity.ai'
 const QUERY_ENDPOINT = `${PERPLEXITY_URL}/rest/sse/perplexity_ask`
@@ -213,22 +218,32 @@ export class PerplexityAdapter {
     return `Network error: ${errorMsg}. Please check your connection and try again.`
   }
 
+  /**
+   * Build perplexity_ask params matching the web client (attachments + search overrides).
+   */
   private buildRequestData(
     query: string,
-    model: string
+    model: string,
+    attachments: string[] = [],
+    options: { webSearch?: boolean; reasoningEffort?: string } = {},
   ): any {
     const frontendUuid = uuid()
     const frontendContextUuid = uuid()
+    const forceSearch = options.webSearch === true
+    const forceNoSearch = options.webSearch === false
+    const researchMode =
+      options.reasoningEffort === 'high' ||
+      String(options.reasoningEffort || '').toLowerCase() === 'research'
 
     const baseParams: any = {
-      attachments: [],
+      attachments,
       language: 'en-US',
       timezone: 'America/Los_Angeles',
       search_focus: 'internet',
       sources: ['web'],
       search_recency_filter: null,
       frontend_uuid: frontendUuid,
-      mode: 'copilot',
+      mode: researchMode ? 'research' : 'copilot',
       model_preference: model,
       is_related_query: false,
       is_sponsored: false,
@@ -273,11 +288,11 @@ export class PerplexityAdapter {
       client_coordinates: null,
       mentions: [],
       dsl_query: query,
-      skip_search_enabled: true,
+      skip_search_enabled: !forceSearch,
       is_nav_suggestions_disabled: false,
       source: 'default',
-      always_search_override: false,
-      override_no_search: false,
+      always_search_override: forceSearch,
+      override_no_search: forceNoSearch,
       should_ask_for_mcp_tool_confirmation: true,
       browser_agent_allow_once_from_toggle: false,
       force_enable_browser_agent: false,
@@ -291,24 +306,66 @@ export class PerplexityAdapter {
     }
   }
 
+  /**
+   * Upload OpenAI media via Perplexity web S3 flow; returns attachment URLs.
+   */
+  private async uploadMessageMedia(
+    messages: PerplexityMessage[],
+    cookieHeader: string,
+    headers: Record<string, string>,
+  ): Promise<{ attachments: string[]; promptAppendix: string }> {
+    const parts = extractMediaParts(messages as any)
+    if (!parts.length) return { attachments: [], promptAppendix: '' }
+
+    const { ok, errors } = await resolveAllMedia(parts, { soft: true })
+    if (errors.length) console.warn('[Perplexity] 媒体解析失败:', errors.join('; '))
+
+    const attachments: string[] = []
+    const failed: typeof ok = []
+    for (const media of ok) {
+      try {
+        const url = await uploadPerplexityAttachment(media, cookieHeader, headers)
+        attachments.push(url)
+        console.log('[Perplexity] 已上传', media.filename, '→', url.slice(0, 80))
+      } catch (err) {
+        console.error('[Perplexity] 上传失败', media.filename, err instanceof Error ? err.message : err)
+        failed.push(media)
+      }
+    }
+
+    const imageFailed = failed.filter((m) => m.kind === 'image')
+    if (imageFailed.length && attachments.length === 0) {
+      throw new Error(
+        `图片上传失败（${imageFailed.map((m) => m.filename).join(', ')}），拒绝改用内联图片`,
+      )
+    }
+
+    return {
+      attachments,
+      promptAppendix: inlineTextFilesAsPrompt(failed.filter((m) => m.kind === 'file')),
+    }
+  }
+
   async chatCompletion(request: ChatCompletionRequest): Promise<{ stream: Readable; sessionId: string }> {
     let query = extractQuery(request.messages)
     if (!query) {
       throw new Error('No user message found in request')
     }
 
-    // Attachments endpoint is not wired; inline text/small images into the query string.
-    const mediaFallback = await resolveMediaPromptAppendix(request.messages as any)
-    if (mediaFallback.errors.length) {
-      console.warn('[Perplexity] media resolve errors:', mediaFallback.errors.join('; '))
-    }
-    if (mediaFallback.appendix) {
-      console.log('[Perplexity] Inlining media into query appendix, count:', mediaFallback.count)
-      query += mediaFallback.appendix
-    }
-
     const model = mapModel(request.model)
     const requestId = uuid()
+    const modelLower = request.model.toLowerCase()
+    const webSearch =
+      request.web_search === true ||
+      modelLower.includes('search') ||
+      modelLower.includes('research')
+        ? true
+        : request.web_search === false
+          ? false
+          : undefined
+    const reasoningEffort =
+      request.reasoning_effort ||
+      (modelLower.includes('research') || modelLower.includes('think') ? 'high' : undefined)
 
     const referer = `${PERPLEXITY_URL}/`
 
@@ -321,7 +378,17 @@ export class PerplexityAdapter {
       'Referer': referer,
     }
 
-    const data = this.buildRequestData(query, model)
+    const uploaded = await this.uploadMessageMedia(
+      request.messages,
+      `__Secure-next-auth.session-token=${this.cookie}`,
+      FAKE_HEADERS,
+    )
+    if (uploaded.promptAppendix) query += uploaded.promptAppendix
+
+    const data = this.buildRequestData(query, model, uploaded.attachments, {
+      webSearch,
+      reasoningEffort,
+    })
 
     // Use Electron's net API which uses Chromium's network stack
     // This bypasses Cloudflare's TLS fingerprint detection

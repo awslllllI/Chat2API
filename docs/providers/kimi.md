@@ -14,9 +14,19 @@
 | --- | --- |
 | Kimi-K2.6 | kimi-k2.6 |
 
+官网忙时往往只开放「快速模型」；思考强度是同模型上的选项，不是单独模型名：
+
+| 客户端参数 | 网页选项 |
+| --- | --- |
+| `reasoning_effort=standard` / `medium` | 思考强度 · 标准 |
+| `reasoning_effort=high` / `advanced` | 思考强度 · 进阶 |
+| `web_search=true` 或模型名含 `search` | 联网搜索 |
+
+完整模型目录后续走 `getAvailableModels` 自动探测（见 `docs/reports/2026-10-29-供应商能力自动检测规划.md`）。
+
 ## 适配状态
 
-已适配：Connect JSON 对话接口、流式/非流式、多轮会话、账号级批量清理、联网搜索和思考参数。
+已适配：Connect JSON 对话接口、流式/非流式、多轮会话、账号级批量清理、联网搜索、思考强度、**网页原生文件/图片上传**（`/apiv2-files/file/upload` → parse → `blocks[].file`，不用 base64 塞 prompt）。
 
 自动续命：代理在 access JWT 临期或上游 401 时，用 `refresh_token` 调用  
 `POST https://auth.kimi.com/api/account.gateway.v1.AuthService/RefreshToken`，并将新的 access / refresh 写回账号。

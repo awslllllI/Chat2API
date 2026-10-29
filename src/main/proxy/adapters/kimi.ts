@@ -21,7 +21,13 @@ import {
   pickKimiCredentials,
   refreshKimiWebTokens,
 } from './kimi-auth'
-import { resolveMediaPromptAppendix } from '../utils/mediaParts'
+import { uploadAndWaitKimiFile } from './kimi-upload'
+import {
+  extractMediaParts,
+  extractTextFromContent,
+  inlineTextFilesAsPrompt,
+  resolveAllMedia,
+} from '../utils/mediaParts'
 
 const KIMI_API_BASE = 'https://www.kimi.com'
 
@@ -58,11 +64,15 @@ interface KimiMessage {
 
 interface ChatCompletionRequest {
   model: string
+  /** Client model name before mapping (for think/search detection) */
+  originalModel?: string
   messages: KimiMessage[]
   stream?: boolean
   temperature?: number
   enableThinking?: boolean
   enableWebSearch?: boolean
+  /** OpenAI reasoning_effort or UI 标准/进阶 */
+  reasoning_effort?: string
   tools?: any[]
   tool_choice?: any
   conversationId?: string
@@ -244,8 +254,7 @@ export class KimiAdapter {
     let systemContent = ''
     const otherMessages = processedMessages.filter(msg => {
       if (msg.role === 'system') {
-        const text = typeof msg.content === 'string' ? msg.content : ''
-        systemContent = text
+        systemContent = extractTextFromContent(msg.content)
         return false
       }
       return true
@@ -271,13 +280,13 @@ export class KimiAdapter {
       
       if (lastUserIdx !== -1) {
         const lastUserMsg = otherMessages[lastUserIdx]
-        const text = typeof lastUserMsg.content === 'string' ? lastUserMsg.content : ''
+        const text = extractTextFromContent(lastUserMsg.content)
         content += `user:${this.wrapUrlsToTags(text)}\n`
         
         // Include any tool results after the last user message
         for (let i = lastUserIdx + 1; i < otherMessages.length; i++) {
           if (otherMessages[i].role === 'user') {
-            const toolText = typeof otherMessages[i].content === 'string' ? otherMessages[i].content : ''
+            const toolText = extractTextFromContent(otherMessages[i].content)
             content += `user:${toolText}\n`
           }
         }
@@ -291,13 +300,13 @@ export class KimiAdapter {
 
     if (otherMessages.length < 2) {
       content += otherMessages.reduce((acc, msg) => {
-        const text = typeof msg.content === 'string' ? msg.content : ''
+        const text = extractTextFromContent(msg.content)
         return acc + `${msg.role === 'user' ? this.wrapUrlsToTags(text) : text}\n`
       }, '')
     } else {
       const latestMessage = otherMessages[otherMessages.length - 1]
       const hasFileOrImage = Array.isArray(latestMessage.content) &&
-        latestMessage.content.some((v: any) => typeof v === 'object' && ['file', 'image_url'].includes(v.type))
+        latestMessage.content.some((v: any) => typeof v === 'object' && ['file', 'image_url', 'image'].includes(v.type))
 
       if (hasFileOrImage) {
         otherMessages.splice(otherMessages.length - 1, 0, {
@@ -312,7 +321,7 @@ export class KimiAdapter {
       }
 
       content += otherMessages.reduce((acc, msg) => {
-        const text = typeof msg.content === 'string' ? msg.content : ''
+        const text = extractTextFromContent(msg.content)
         return acc + `${msg.role}:${msg.role === 'user' ? this.wrapUrlsToTags(text) : text}\n`
       }, '')
     }
@@ -330,6 +339,60 @@ export class KimiAdapter {
       /https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{2,256}\.[a-z]{2,6}\b([-a-zA-Z0-9@:%_\+.~#?&//=]*)/gi,
       url => `<url id="" type="url" status="" title="" wc="">${url}</url>`
     )
+  }
+
+  /**
+   * Upload OpenAI media parts via Kimi web /apiv2-files; never inline images as base64.
+   * Text-only files fall back to prompt appendix when upload fails.
+   */
+  private async uploadMessageMedia(
+    messages: KimiMessage[],
+    accessToken: string,
+  ): Promise<{ files: Array<{ id: string }>; promptAppendix: string }> {
+    const parts = extractMediaParts(messages as any)
+    if (!parts.length) return { files: [], promptAppendix: '' }
+
+    const { ok, errors } = await resolveAllMedia(parts, { soft: true })
+    if (errors.length) {
+      console.warn('[Kimi] 媒体解析失败:', errors.join('; '))
+    }
+    if (!ok.length) return { files: [], promptAppendix: '' }
+
+    const files: Array<{ id: string }> = []
+    const failed: typeof ok = []
+    const ctx = {
+      apiBase: KIMI_API_BASE,
+      accessToken,
+      headers: FAKE_HEADERS,
+    }
+
+    for (const media of ok) {
+      try {
+        const uploaded = await uploadAndWaitKimiFile(media, ctx)
+        files.push({ id: uploaded.id })
+        console.log('[Kimi] 已上传', media.filename, '→', uploaded.id)
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        console.error('[Kimi] 原生上传失败', media.filename, msg)
+        failed.push(media)
+        errors.push(`${media.filename}: ${msg}`)
+      }
+    }
+
+    const imageFailed = failed.filter((m) => m.kind === 'image')
+    if (imageFailed.length && files.length === 0) {
+      const detail =
+        errors.filter((e) => e.includes(':')).slice(-3).join(' | ') ||
+        errors[0] ||
+        '网页文件接口上传或解析失败'
+      throw new Error(
+        `图片上传失败（${imageFailed.map((m) => m.filename).join(', ')}）: ${detail}`,
+      )
+    }
+
+    // Text files only — never embed images as data URLs
+    const promptAppendix = inlineTextFilesAsPrompt(failed.filter((m) => m.kind === 'file'))
+    return { files, promptAppendix }
   }
 
   async chatCompletion(request: ChatCompletionRequest): Promise<{ response: AxiosResponse; conversationId: string }> {
@@ -372,15 +435,10 @@ export class KimiAdapter {
 
     let content = this.messagesPrepare(messages, toolsPrompt, false)
 
-    // Best-effort media: Connect chat API has no public pre-sign surface yet —
-    // inline text files / small images into the prompt so multimodal clients still work.
-    const mediaFallback = await resolveMediaPromptAppendix(messages)
-    if (mediaFallback.errors.length) {
-      console.warn('[Kimi] media resolve errors:', mediaFallback.errors.join('; '))
-    }
-    if (mediaFallback.appendix) {
-      console.log('[Kimi] Inlining media into prompt appendix, count:', mediaFallback.count)
-      content += mediaFallback.appendix
+    // Native web upload: FormData → /apiv2-files/file/upload → parse poll → file blocks
+    const uploadedFiles = await this.uploadMessageMedia(messages, accessToken)
+    if (uploadedFiles.promptAppendix) {
+      content += uploadedFiles.promptAppendix
     }
 
     // Determine if thinking and web search should be enabled
@@ -391,11 +449,18 @@ export class KimiAdapter {
 
     let enableThinking = request.enableThinking ?? false
     let enableWebSearch = request.enableWebSearch ?? false
+    const reasoningEffort = request.reasoning_effort
 
     // Auto-enable based on model name (if not explicitly set)
-    if (!enableThinking && (modelLower.includes('think') || modelLower.includes('r1'))) {
+    if (
+      !enableThinking &&
+      (Boolean(reasoningEffort) ||
+        modelLower.includes('think') ||
+        modelLower.includes('r1') ||
+        modelLower.includes('reason'))
+    ) {
       enableThinking = true
-      console.log('[Kimi] Thinking mode enabled (from model name)')
+      console.log('[Kimi] Thinking mode enabled (from model/reasoning_effort)')
     }
     if (!enableWebSearch && modelLower.includes('search')) {
       enableWebSearch = true
@@ -403,10 +468,12 @@ export class KimiAdapter {
     }
 
     const payload = createKimiChatPayload({
-      model: request.model,
+      model: modelForDetection,
       content,
       enableWebSearch,
       enableThinking,
+      reasoningEffort,
+      files: uploadedFiles.files,
     })
     const frameBuffer = encodeKimiGrpcFrame(payload)
 

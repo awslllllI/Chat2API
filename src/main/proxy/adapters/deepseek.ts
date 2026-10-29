@@ -353,7 +353,7 @@ export class DeepSeekAdapter {
       throw new Error(`DeepSeek upload failed: HTTP ${uploadRes.status} ${JSON.stringify(uploadRes.data)?.slice(0, 200)}`)
     }
 
-    console.log('[DeepSeek] Uploaded file', fileId, 'status=', biz.status)
+    console.log('[DeepSeek] 已上传文件', fileId, '状态=', biz.status)
 
     const deadline = Date.now() + 90_000
     while (Date.now() < deadline) {
@@ -373,15 +373,15 @@ export class DeepSeekAdapter {
       const entry = Array.isArray(files) ? files.find((f: any) => f.id === fileId) || files[0] : null
       const status = entry?.status
       if (status === 'SUCCESS') {
-        console.log('[DeepSeek] File parse SUCCESS', fileId)
+        console.log('[DeepSeek] 文件解析成功', fileId)
         return fileId
       }
       if (status === 'FAILED') {
-        throw new Error(`DeepSeek file parse failed: ${entry?.error_code || 'FAILED'}`)
+        throw new Error(`文件解析失败: ${entry?.error_code || 'FAILED'}`)
       }
       await new Promise((r) => setTimeout(r, 1500))
     }
-    throw new Error(`DeepSeek file parse timeout: ${fileId}`)
+    throw new Error(`文件解析超时: ${fileId}`)
   }
 
   /**
@@ -393,7 +393,7 @@ export class DeepSeekAdapter {
 
     const { ok, errors } = await resolveAllMedia(parts, { soft: true })
     if (errors.length) {
-      console.warn('[DeepSeek] Some media failed to resolve:', errors.join('; '))
+      console.warn('[DeepSeek] 媒体解析失败:', errors.join('; '))
     }
 
     const refFileIds: string[] = []
@@ -405,7 +405,7 @@ export class DeepSeekAdapter {
         const id = await this.uploadAndWaitFile(media)
         refFileIds.push(id)
       } catch (err) {
-        console.error('[DeepSeek] Upload failed for', media.filename, err)
+        console.error('[DeepSeek] 上传失败', media.filename, err)
       }
     }
 
@@ -533,7 +533,7 @@ export class DeepSeekAdapter {
     }
 
     if (refFileIds.length) {
-      console.log('[DeepSeek] Attaching files:', refFileIds.join(', '))
+      console.log('[DeepSeek] 附加文件:', refFileIds.join(', '))
     }
 
     const response = await axios.post(

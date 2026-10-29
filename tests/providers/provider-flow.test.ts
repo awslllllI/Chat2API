@@ -210,12 +210,17 @@ test('Kimi K2.6 model mapping reaches the web chat request payload', () => {
     content: 'hello',
     enableWebSearch: true,
     enableThinking: true,
+    reasoningEffort: 'standard',
+    files: [{ id: 'file_test_1' }],
   })
 
   assert.equal(payload.scenario, 'SCENARIO_K2D6')
   assert.equal(payload.message.scenario, 'SCENARIO_K2D6')
   assert.deepEqual(payload.tools, [{ type: 'TOOL_TYPE_SEARCH', search: {} }])
   assert.equal(payload.options.thinking, true)
+  assert.equal(payload.options.reasoning_effort, 'REASONING_EFFORT_MEDIUM')
+  assert.equal(payload.options.speed, 'SPEED_FAST')
+  assert.equal((payload.message.blocks as any[])[1]?.file?.id, 'file_test_1')
 
   const frame = encodeKimiGrpcFrame(payload)
   assert.equal(frame.readUInt8(0), 0)

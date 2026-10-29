@@ -229,7 +229,7 @@ export class GLMAdapter {
    * Upload resolved media bytes to GLM multipart endpoint.
    */
   private async uploadResolvedMedia(media: ResolvedMediaBytes): Promise<{ source_id: string; file_url?: string }> {
-    console.log('[GLM] Uploading file:', media.filename, media.size)
+    console.log('[GLM] 正在上传文件:', media.filename, media.size)
 
     const formData = new FormData()
     formData.append('file', media.buffer, {
@@ -255,11 +255,25 @@ export class GLMAdapter {
     )
 
     if (response.status !== 200 || !response.data?.result) {
-      throw new Error(`File upload failed: HTTP ${response.status}`)
+      throw new Error(`文件上传失败: HTTP ${response.status} ${JSON.stringify(response.data)?.slice(0, 200)}`)
     }
 
-    console.log('[GLM] File uploaded successfully:', response.data.result.source_id)
-    return response.data.result
+    const result = response.data.result
+    const sourceId =
+      result.source_id ||
+      result.sourceId ||
+      result.file_id ||
+      result.fileId ||
+      result.id ||
+      result.uuid
+    const fileUrl = result.file_url || result.fileUrl || result.url
+    if (!sourceId) {
+      console.error('[GLM] 上传响应缺少来源标识:', JSON.stringify(result)?.slice(0, 300))
+      throw new Error('文件上传成功但响应缺少来源标识')
+    }
+
+    console.log('[GLM] 文件上传成功:', sourceId)
+    return { source_id: String(sourceId), file_url: fileUrl ? String(fileUrl) : undefined }
   }
 
   /**
@@ -270,7 +284,7 @@ export class GLMAdapter {
     if (!parts.length) return []
 
     const { ok, errors } = await resolveAllMedia(parts, { soft: true, maxBytes: FILE_MAX_SIZE })
-    if (errors.length) console.warn('[GLM] media resolve errors:', errors.join('; '))
+    if (errors.length) console.warn('[GLM] 媒体解析失败:', errors.join('; '))
 
     const refs: any[] = []
     for (const media of ok) {
@@ -290,7 +304,7 @@ export class GLMAdapter {
           })
         }
       } catch (error) {
-        console.error('[GLM] Failed to upload media:', media.filename, error)
+        console.error('[GLM] 媒体上传失败:', media.filename, error)
       }
     }
     return refs
@@ -454,7 +468,7 @@ export class GLMAdapter {
 
     const refs = await this.uploadMessageMedia(messages)
     if (refs.length) {
-      console.log('[GLM] Attached media refs:', refs.length)
+      console.log('[GLM] 已附加媒体引用:', refs.length)
     }
 
     const preparedMessages = this.messagesToPrompt(messages, refs, toolsPrompt, false)

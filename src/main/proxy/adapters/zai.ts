@@ -17,11 +17,26 @@ import {
   createBaseChunk,
   ToolCallState 
 } from '../utils/streamToolHandler'
+import FormData from 'form-data'
 import {
   extractMediaParts,
   inlineTextFilesAsPrompt,
   resolveAllMedia,
+  type ResolvedMediaBytes,
 } from '../utils/mediaParts'
+
+/** Uploaded PFS file entry for Z.ai chat `files` field */
+interface ZaiChatFile {
+  type: 'file' | 'image'
+  media: 'file' | 'image'
+  id: string
+  pfs_file_id: string
+  name: string
+  size: number
+  status: 'uploaded'
+  itemId: string
+  uploadedAt: number
+}
 
 const ZAI_API_BASE = 'https://chat.z.ai'
 const X_FE_VERSION = 'prod-fe-1.1.37'
@@ -338,6 +353,110 @@ export class ZaiAdapter {
     }
   }
 
+  /**
+   * Upload media via Z.ai PFS endpoint; chat body uses `files` with pfs_file_id (no image base64).
+   */
+  private async uploadMessageMedia(
+    messages: Array<{ content?: any }>,
+    token: string,
+  ): Promise<{ files: ZaiChatFile[]; promptAppendix: string; hasImages: boolean }> {
+    const parts = extractMediaParts(messages)
+    const hasImages = parts.some((p) => p.kind === 'image')
+    if (!parts.length) return { files: [], promptAppendix: '', hasImages: false }
+
+    const { ok, errors } = await resolveAllMedia(parts, { soft: true })
+    if (errors.length) console.warn('[Z.ai] 媒体解析失败:', errors.join('; '))
+
+    const files: ZaiChatFile[] = []
+    const failed: ResolvedMediaBytes[] = []
+
+    for (const media of ok) {
+      if (media.kind === 'audio' || media.kind === 'video') {
+        console.warn('[Z.ai] 跳过不支持的媒体类型:', media.kind, media.filename)
+        continue
+      }
+      try {
+        const form = new FormData()
+        form.append('file', media.buffer, {
+          filename: media.filename,
+          contentType: media.mimeType,
+        })
+        const uploadRes = await axios.post(
+          `${ZAI_API_BASE}/api/v1/storage/pfs/files/upload`,
+          form,
+          {
+            headers: {
+              Authorization: `Bearer ${token}`,
+              'Accept-Language': 'zh-CN',
+              ...form.getHeaders(),
+            },
+            maxBodyLength: Infinity,
+            timeout: 120000,
+            validateStatus: () => true,
+          },
+        )
+        const fileObj = uploadRes.data?.data?.file || uploadRes.data?.file
+        const fileId = fileObj?.id || fileObj?.file_id
+        if (uploadRes.status < 200 || uploadRes.status >= 300 || uploadRes.data?.code !== 0 || !fileId) {
+          throw new Error(
+            `HTTP ${uploadRes.status} ${JSON.stringify(uploadRes.data)?.slice(0, 200)}`,
+          )
+        }
+        const kind = media.kind === 'image' ? 'image' : 'file'
+        files.push({
+          type: kind,
+          media: kind,
+          id: String(fileId),
+          pfs_file_id: String(fileId),
+          name: encodeURIComponent(media.filename),
+          size: media.size,
+          status: 'uploaded',
+          itemId: uuid(),
+          uploadedAt: Date.now(),
+        })
+        console.log('[Z.ai] 已上传', media.filename, '→', fileId)
+      } catch (err) {
+        console.error('[Z.ai] 文件上传失败', media.filename, err instanceof Error ? err.message : err)
+        failed.push(media)
+      }
+    }
+
+    const imageFailed = failed.filter((m) => m.kind === 'image')
+    if (imageFailed.length && !files.some((f) => f.media === 'image')) {
+      throw new Error(
+        `图片上传失败（${imageFailed.map((m) => m.filename).join(', ')}），拒绝改用内联图片`,
+      )
+    }
+
+    // Text files may fall back to prompt; images go through PFS `files` only (no base64).
+    return {
+      files,
+      promptAppendix: inlineTextFilesAsPrompt(failed.filter((m) => m.kind === 'file')),
+      hasImages: hasImages || files.some((f) => f.media === 'image'),
+    }
+  }
+
+  /**
+   * Strip OpenAI image_url / file parts once media is attached via PFS `files`.
+   */
+  private stripMediaPartsFromMessages(messages: Array<{ role?: string; content?: any }>): Array<{ role?: string; content?: any }> {
+    return messages.map((msg) => {
+      if (!Array.isArray(msg.content)) return msg
+      const next = msg.content.filter((part: any) => {
+        if (!part || typeof part !== 'object') return true
+        const t = String(part.type || '')
+        return t !== 'image_url' && t !== 'image' && t !== 'file' && t !== 'input_audio' && t !== 'video_url'
+      })
+      if (next.length === 0) {
+        return { ...msg, content: '' }
+      }
+      if (next.length === 1 && next[0]?.type === 'text' && typeof next[0].text === 'string') {
+        return { ...msg, content: next[0].text }
+      }
+      return { ...msg, content: next }
+    })
+  }
+
   async chatCompletion(request: ChatCompletionRequest): Promise<{ response: AxiosResponse; chatId: string; requestId: string }> {
     const token = await this.ensureToken()
     const userId = this.extractUserIDFromToken(token)
@@ -428,29 +547,29 @@ export class ZaiAdapter {
       console.log('[Z.ai] Web search enabled (from model name)')
     }
 
-    // Keep OpenAI image_url parts for VLM models; inline text-file bytes into last user message.
-    const mediaParts = extractMediaParts(processedMessages as any)
-    const hasImages = mediaParts.some((p) => p.kind === 'image')
-    if (mediaParts.length) {
-      const { ok, errors } = await resolveAllMedia(mediaParts, { soft: true })
-      if (errors.length) console.warn('[Z.ai] media resolve errors:', errors.join('; '))
-      const fileAppendix = inlineTextFilesAsPrompt(ok.filter((m) => m.kind === 'file'))
-      if (fileAppendix) {
-        for (let i = processedMessages.length - 1; i >= 0; i--) {
-          if (processedMessages[i].role !== 'user') continue
-          const content = processedMessages[i].content
-          if (typeof content === 'string') {
-            processedMessages[i] = { ...processedMessages[i], content: content + fileAppendix }
-          } else if (Array.isArray(content)) {
-            processedMessages[i] = {
-              ...processedMessages[i],
-              content: [...content, { type: 'text', text: fileAppendix }],
-            }
+    // Native PFS upload for files; keep OpenAI image_url parts for VLM when upload unavailable.
+    const { files: zaiFiles, promptAppendix, hasImages } = await this.uploadMessageMedia(
+      processedMessages as any,
+      token,
+    )
+    if (promptAppendix) {
+      for (let i = processedMessages.length - 1; i >= 0; i--) {
+        if (processedMessages[i].role !== 'user') continue
+        const content = processedMessages[i].content
+        if (typeof content === 'string') {
+          processedMessages[i] = { ...processedMessages[i], content: content + promptAppendix }
+        } else if (Array.isArray(content)) {
+          processedMessages[i] = {
+            ...processedMessages[i],
+            content: [...content, { type: 'text', text: promptAppendix }],
           }
-          break
         }
+        break
       }
-      console.log('[Z.ai] Media parts:', mediaParts.length, 'images:', hasImages)
+    }
+    if (zaiFiles.length) {
+      console.log('[Z.ai] 附加文件:', zaiFiles.map((f) => f.id).join(', '))
+      processedMessages = this.stripMediaPartsFromMessages(processedMessages as any) as typeof processedMessages
     }
 
     // Z.ai API uses auto_web_search for web search feature
@@ -493,6 +612,7 @@ export class ZaiAdapter {
         title_generation: true,
         tags_generation: true,
       },
+      ...(zaiFiles.length ? { files: zaiFiles } : {}),
     }
 
     const captchaVerifyParam = this.getCaptchaVerifyParam()
