@@ -290,17 +290,22 @@ export class GLMAdapter {
     for (const media of ok) {
       try {
         const result = await this.uploadResolvedMedia(media)
+        // Only keep real CDN URLs; never fall back to truncated data: sourceUrl
+        const httpsUrl =
+          result.file_url && /^https?:\/\//i.test(result.file_url) ? result.file_url : undefined
         if (media.kind === 'image') {
           refs.push({
+            kind: 'image',
             source_id: result.source_id,
-            image_url: result.file_url || media.sourceUrl,
+            image_url: httpsUrl,
             width: 0,
             height: 0,
           })
         } else {
           refs.push({
+            kind: 'file',
             source_id: result.source_id,
-            file_url: result.file_url || media.sourceUrl,
+            file_url: httpsUrl,
           })
         }
       } catch (error) {
@@ -312,9 +317,13 @@ export class GLMAdapter {
 
   private messagesToPrompt(messages: GLMMessage[], refs: any[] = [], toolsPrompt?: string, isMultiTurn: boolean = false): { role: string; content: any[] }[] {
     const toolProfile = getProviderToolProfile('glm')
-    // Separate image refs and file refs
-    const imageRefs = refs.filter((ref) => ref.width !== undefined || ref.height !== undefined || ref.image_url)
-    const fileRefs = refs.filter((ref) => !ref.width && !ref.height && !ref.image_url)
+    // Separate image refs and file refs (kind preferred; legacy shape still works)
+    const imageRefs = refs.filter(
+      (ref) => ref.kind === 'image' || ref.width !== undefined || ref.height !== undefined || ref.image_url,
+    )
+    const fileRefs = refs.filter(
+      (ref) => ref.kind === 'file' || (!ref.kind && !ref.width && !ref.height && !ref.image_url),
+    )
 
     // Build content array
     const content: any[] = []
@@ -325,18 +334,21 @@ export class GLMAdapter {
         type: 'file',
         file: fileRefs.map((ref) => ({
           source_id: ref.source_id,
-          file_url: ref.file_url,
+          ...(ref.file_url ? { file_url: ref.file_url } : {}),
         })),
       })
     }
 
-    // Add image references
-    for (const imageRef of imageRefs) {
+    // Mount images like the web UI: type=image + source_id (not OpenAI image_url)
+    if (imageRefs.length > 0) {
       content.push({
-        type: 'image_url',
-        image_url: {
-          url: imageRef.image_url || imageRef.source_id,
-        },
+        type: 'image',
+        image: imageRefs.map((ref) => ({
+          source_id: ref.source_id,
+          ...(ref.image_url ? { image_url: ref.image_url } : {}),
+          width: ref.width ?? 0,
+          height: ref.height ?? 0,
+        })),
       })
     }
 

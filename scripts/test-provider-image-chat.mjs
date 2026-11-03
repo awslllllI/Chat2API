@@ -36,6 +36,7 @@ console.log(`测试照片: ${PHOTO} (${photoBuf.length} 字节)`)
 console.log(`代理: ${baseUrl}`)
 
 const CASES = [
+  { provider: 'DeepSeek', model: 'deepseek-v4-flash' },
   { provider: 'Kimi', model: 'Kimi-K2.6' },
   { provider: 'MiniMax', model: 'MiniMax-M2.7' },
   { provider: 'Qwen', model: 'Qwen3-Max' },

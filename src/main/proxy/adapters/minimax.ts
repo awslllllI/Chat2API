@@ -28,14 +28,17 @@ import {
   ToolCallState 
 } from '../utils/streamToolHandler'
 
-const AGENT_BASE_URL = 'https://agent.minimaxi.com'
+/** CN web origin (agent.minimaxi.com redirects here for REGION=cn) */
+const AGENT_BASE_URL = 'https://agent.minimax.cn'
+/** Web client x-signature salt (axios interceptor), not JWT */
+const MINIMAX_SIGNATURE_SALT = 'I*7Cf%WZ#S&%1RlZJ&C2'
 
 const FAKE_HEADERS = {
   Accept: 'application/json, text/plain, */*',
   'Accept-Encoding': 'gzip, deflate, br, zstd',
   'Accept-Language': 'zh-CN,zh;q=0.9',
   'Cache-Control': 'no-cache',
-  Origin: 'https://agent.minimaxi.com',
+  Origin: AGENT_BASE_URL,
   Pragma: 'no-cache',
   'Sec-Ch-Ua': '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
   'Sec-Ch-Ua-Mobile': '?0',
@@ -51,6 +54,7 @@ const FAKE_USER_DATA: Record<string, any> = {
   biz_id: '3',
   app_id: '3001',
   version_code: '22201',
+  region: 'cn',
   uuid: null,
   device_id: null,
   os_name: 'Mac',
@@ -121,10 +125,23 @@ function uuid(): string {
   })
 }
 
+/**
+ * MD5 hex digest used by MiniMax yy / x-signature headers.
+ */
 function md5(input: string): string {
   return crypto.createHash('md5').update(input).digest('hex')
 }
 
+/**
+ * Build x-signature matching the official web client.
+ */
+function buildMiniMaxSignature(timestamp: number, bodyJson: string): string {
+  return md5(`${timestamp}${MINIMAX_SIGNATURE_SALT}${bodyJson}`)
+}
+
+/**
+ * Current unix time in seconds.
+ */
 function unixTimestamp(): number {
   return Math.floor(Date.now() / 1000)
 }
@@ -257,7 +274,7 @@ export class MiniMaxAdapter {
     const dataJson = JSON.stringify({ uuid: randomUuid })
     const fullUri = `/v1/api/user/device/register?${queryStr}`
     const yy = md5(`${encodeURIComponent(fullUri)}_${dataJson}${md5(unix)}ooui`)
-    const signature = md5(`${timestamp}${this.jwtToken}${dataJson}`)
+    const signature = buildMiniMaxSignature(timestamp, dataJson)
 
     console.log('[MiniMax] Registering device - randomUuid:', randomUuid, 'realUserID:', this.realUserID)
 
@@ -328,7 +345,7 @@ export class MiniMaxAdapter {
     const dataJson = JSON.stringify(data || {})
     const fullUri = `${uri}${uri.lastIndexOf('?') != -1 ? '&' : '?'}${queryStr}`
     const yy = md5(`${encodeURIComponent(fullUri)}_${dataJson}${md5(unix)}ooui`)
-    const signature = md5(`${timestamp}${this.jwtToken}${dataJson}`)
+    const signature = buildMiniMaxSignature(timestamp, dataJson)
 
     console.log('[MiniMax] Request - uuid:', realUserID, 'user_id:', realUserID, 'device_id:', deviceInfo.deviceId)
 
@@ -377,7 +394,7 @@ export class MiniMaxAdapter {
 
     const dataJson = JSON.stringify(requestBody)
     const yy = md5(`${encodeURIComponent(`${uri}?${queryStr}`)}_${dataJson}${md5(unix)}ooui`)
-    const signature = md5(`${timestamp}${this.jwtToken}${dataJson}`)
+    const signature = buildMiniMaxSignature(timestamp, dataJson)
 
     console.log('[MiniMax] Stream Request - uuid:', realUserID, 'user_id:', realUserID, 'device_id:', deviceInfo.deviceId)
     console.log('[MiniMax] Request body:', dataJson)
@@ -594,31 +611,43 @@ export class MiniMaxAdapter {
       throw new Error('上传预签名返回缺少对象键或表单字段')
     }
 
-    const form = new FormData()
+    // 使用与浏览器一致的 multipart（Blob + fetch），避免 form-data 包字段差异
+    const form = new globalThis.FormData()
     for (const [key, value] of Object.entries(formFields as Record<string, string>)) {
       form.append(key, String(value))
     }
-    form.append('file', media.buffer, {
-      filename: media.filename || 'upload.bin',
-      contentType: mimeType,
+    const fileName = media.filename || 'upload.bin'
+    form.append(
+      'file',
+      new Blob([media.buffer], { type: mimeType }),
+      fileName,
+    )
+    const putRes = await fetch(uploadUrl, {
+      method: 'POST',
+      body: form,
+      redirect: 'error',
+      // credentials omit — matches web client
     })
-    const putRes = await axios.post(uploadUrl, form, {
-      headers: form.getHeaders(),
-      maxBodyLength: Infinity,
-      maxContentLength: Infinity,
-      timeout: 600_000,
-      validateStatus: () => true,
-      maxRedirects: 0,
-    })
-    if (putRes.status !== 204 && (putRes.status < 200 || putRes.status >= 300)) {
+    // 网页端严格要求 OSS 返回 204（success_action_status）
+    if (putRes.status !== 204) {
       throw new Error(`对象存储上传失败: HTTP ${putRes.status}`)
     }
 
+    console.log('[MiniMax] 对象存储落盘成功:', objectKey, 'host=', (() => {
+      try {
+        return new URL(uploadUrl).hostname
+      } catch {
+        return uploadUrl.slice(0, 80)
+      }
+    })())
+
+    // matrix send_msg 挂载：attachment_type + file.object_key
+    // 若上游返回 “owned object_key” 错误，说明预签名归属校验未通过（账号/区域问题）
     return {
       attachment_type: media.kind === 'image' ? 1 : 2,
       file: {
         object_key: objectKey,
-        file_name: media.filename,
+        file_name: fileName,
       },
     }
   }

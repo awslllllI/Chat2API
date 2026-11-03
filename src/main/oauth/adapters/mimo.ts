@@ -8,6 +8,7 @@
  * - xiaomichatbot_ph
  */
 
+import axios from 'axios'
 import { BaseOAuthAdapter } from './base'
 import {
   OAuthResult,
@@ -83,6 +84,9 @@ export class MimoAdapter extends BaseOAuthAdapter {
     // No callback processing needed for cookie-based auth
   }
 
+  /**
+   * Validate MiMo credentials by calling a real upstream API.
+   */
   async validateToken(credentials: Record<string, string>): Promise<TokenValidationResult> {
     const serviceToken = credentials['service_token'] || credentials['serviceToken']
     const userId = credentials['user_id'] || credentials['userId']
@@ -95,13 +99,53 @@ export class MimoAdapter extends BaseOAuthAdapter {
       }
     }
 
-    return {
-      valid: true,
-      tokenType: 'cookie',
-      accountInfo: {
-        userId: userId,
-        name: 'Mimo User',
-      },
+    try {
+      const response = await axios.post(
+        `https://aistudio.xiaomimimo.com/open-apis/resource/genUploadInfo?xiaomichatbot_ph=${encodeURIComponent(phToken)}`,
+        {
+          fileName: 'probe.png',
+          fileSize: 16,
+          contentType: 'image/png',
+        },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            Cookie: `serviceToken=${serviceToken}; userId=${userId}; xiaomichatbot_ph=${phToken}`,
+            Origin: 'https://aistudio.xiaomimimo.com',
+            Referer: 'https://aistudio.xiaomimimo.com/',
+          },
+          timeout: 15000,
+          validateStatus: () => true,
+        },
+      )
+
+      if (response.status === 401 || response.data?.code === 401) {
+        return {
+          valid: false,
+          error: 'MiMo 登录已失效，请重新登录后粘贴 service_token / user_id / ph_token',
+        }
+      }
+
+      if (response.status < 200 || response.status >= 300) {
+        return {
+          valid: false,
+          error: `MiMo 校验失败: HTTP ${response.status}`,
+        }
+      }
+
+      return {
+        valid: true,
+        tokenType: 'cookie',
+        accountInfo: {
+          userId,
+          name: 'Mimo User',
+        },
+      }
+    } catch (error) {
+      return {
+        valid: false,
+        error: error instanceof Error ? error.message : 'Validation request failed',
+      }
     }
   }
 

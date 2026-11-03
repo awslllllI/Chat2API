@@ -55,10 +55,26 @@ const FAKE_USER_DATA: Record<string, any> = {
   token: null,
 }
 
+/** Web client x-signature salt (same as proxy MiniMax adapter) */
+const MINIMAX_SIGNATURE_SALT = 'I*7Cf%WZ#S&%1RlZJ&C2'
+
+/**
+ * MD5 hex digest for MiniMax request headers.
+ */
 function md5(input: string): string {
   return crypto.createHash('md5').update(input).digest('hex')
 }
 
+/**
+ * Build x-signature matching the official web client.
+ */
+function buildMiniMaxSignature(timestamp: number, bodyJson: string): string {
+  return md5(`${timestamp}${MINIMAX_SIGNATURE_SALT}${bodyJson}`)
+}
+
+/**
+ * Current unix time in seconds.
+ */
 function unixTimestamp(): number {
   return Math.floor(Date.now() / 1000)
 }
@@ -213,7 +229,7 @@ export class MiniMaxAdapter extends BaseOAuthAdapter {
       const fullUri = `${uri}?${queryStr}`
       const dataJson = '{}'
       const yy = md5(`${encodeURIComponent(fullUri)}_${dataJson}${md5(unix)}ooui`)
-      const signature = md5(`${timestamp}${jwtToken}${dataJson}`)
+      const signature = buildMiniMaxSignature(timestamp, dataJson)
 
       console.log('[MiniMax OAuth] Request - uuid:', realUserID, 'user_id:', realUserID)
 

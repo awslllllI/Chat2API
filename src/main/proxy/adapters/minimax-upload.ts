@@ -21,10 +21,25 @@ export const MINIMAX_UPLOAD_PURPOSE = {
 
 export type MiniMaxAttachment = {
   attachment_type: 1 | 2
+  /** Cloud/web flat fields (some send_msg validators read top-level object_key) */
+  type?: 'image' | 'file'
+  object_key?: string
+  file_name?: string
+  mime_type?: string
+  meta?: {
+    attachment_type: 'image' | 'file'
+    file_name: string
+    mime_type: string
+    size_bytes: number
+  }
+  cloud?: {
+    object_key: string
+  }
   file: {
     object_key: string
     file_name: string
     file_url?: string
+    mime_type?: string
   }
 }
 

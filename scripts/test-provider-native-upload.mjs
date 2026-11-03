@@ -137,7 +137,7 @@ async function testMiniMax(account) {
     const fullUri = `${pathOnly}?${q.slice(1)}`
     return {
       'x-timestamp': String(timestamp),
-      'x-signature': md5(`${timestamp}${jwt}${dataJson}`),
+      'x-signature': md5(`${timestamp}I*7Cf%WZ#S&%1RlZJ&C2${dataJson}`),
       yy: md5(`${encodeURIComponent(fullUri)}_${dataJson}${md5(unix)}ooui`),
     }
   }

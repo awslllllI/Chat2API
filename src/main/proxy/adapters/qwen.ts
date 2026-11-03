@@ -68,6 +68,19 @@ function hasToolCalls(content: string): boolean {
 const QWEN_API_BASE = 'https://chat2.qianwen.com'
 const QWEN_CHAT2_API_BASE = 'https://chat2-api.qianwen.com'
 const QWEN_CHAT_SIDE_API_BASE = 'https://chat-side.qianwen.com'
+const QWEN_QUARK_MOS_API_BASE = 'https://quark-mos-api.qianwen.com'
+const QWEN_WORKSPACE_API_BASE = 'https://workspace-res.qianwen.com'
+const QWEN_PORTAL_API_BASE = 'https://api.qianwen.com'
+
+/** Hosts that may serve /api/v2/files/* (chat-side is the live one as of 2026-11) */
+const QWEN_FILE_API_BASES = [
+  QWEN_CHAT_SIDE_API_BASE,
+  QWEN_QUARK_MOS_API_BASE,
+  QWEN_CHAT2_API_BASE,
+  QWEN_API_BASE,
+  QWEN_WORKSPACE_API_BASE,
+  QWEN_PORTAL_API_BASE,
+]
 
 const MODEL_MAP: Record<string, string> = {
   'Qwen3.6': 'Qwen',
@@ -331,36 +344,45 @@ export class QwenAdapter {
 
   /**
    * Request temporary OSS credentials for chat2 file upload.
+   * Returns STS payload plus the file-API base that accepted the ticket.
    */
   private async getStsToken(
     ticket: string,
     filename: string,
     filesize: number,
     filetype: 'file' | 'image',
-  ): Promise<QwenStsToken> {
-    // chat2 页面域名与 chat2-api 网关都可能承载该接口，依次尝试
-    const endpoints = [
-      `${QWEN_CHAT2_API_BASE}/api/v2/files/getstsToken`,
-      `${QWEN_API_BASE}/api/v2/files/getstsToken`,
-      `${QWEN_CHAT_SIDE_API_BASE}/api/v2/files/getstsToken`,
-    ]
+  ): Promise<{ sts: QwenStsToken; fileApiBase: string }> {
+    const paths = ['/api/v2/files/getstsToken', '/api/v1/files/getstsToken']
     let lastErr = ''
-    for (const url of endpoints) {
-      const response = await axios.post(
-        url,
-        { filename, filesize: String(filesize), filetype },
-        {
-          headers: this.getApiHeaders(ticket),
-          params: this.getApiParams(),
-          timeout: 30000,
-          validateStatus: () => true,
-        },
-      )
-      if (response.status === 200 && response.data?.data) {
-        return response.data.data as QwenStsToken
+    for (const base of QWEN_FILE_API_BASES) {
+      for (const path of paths) {
+        const url = `${base}${path}`
+        const response = await axios.post(
+          url,
+          { filename, filesize: String(filesize), filetype },
+          {
+            headers: this.getApiHeaders(ticket),
+            params: this.getApiParams(),
+            timeout: 30000,
+            validateStatus: () => true,
+          },
+        )
+        if (response.status === 200 && response.data?.data) {
+          console.log('[Qwen] 临时凭证申请成功:', base)
+          return { sts: response.data.data as QwenStsToken, fileApiBase: base }
+        }
+        const errCode = response.data?.errorCode || response.data?.data?.code
+        lastErr = `HTTP ${response.status} ${JSON.stringify(response.data)?.slice(0, 160)} @ ${url}`
+        if (response.status === 200 && (errCode === 'NOT_LOGIN' || errCode === 'Unauthorized')) {
+          // chat-side 已确认存在该接口；NOT_LOGIN 说明 tongyi_sso_ticket 未被该域接受
+          console.warn('[Qwen] 临时凭证接口未登录（ticket 可能未同步到 chat-side）:', lastErr)
+          throw new Error(
+            `申请临时凭证失败: chat-side 返回未登录。请重新在浏览器登录通义后更新 ticket。详情: ${lastErr}`,
+          )
+        } else if (response.status !== 404) {
+          console.warn('[Qwen] 申请临时凭证未成功，尝试下一地址:', lastErr)
+        }
       }
-      lastErr = `HTTP ${response.status} ${JSON.stringify(response.data)?.slice(0, 160)} @ ${url}`
-      console.warn('[Qwen] 申请临时凭证未成功，尝试下一地址:', lastErr)
     }
     throw new Error(`申请临时凭证失败: ${lastErr}`)
   }
@@ -408,11 +430,15 @@ export class QwenAdapter {
   }
 
   /**
-   * Trigger and poll server-side document parse.
+   * Trigger and poll server-side document parse on the same host that issued STS.
    */
-  private async parseUploadedFile(ticket: string, fileId: string): Promise<void> {
+  private async parseUploadedFile(
+    ticket: string,
+    fileId: string,
+    fileApiBase: string = QWEN_CHAT_SIDE_API_BASE,
+  ): Promise<void> {
     await axios.post(
-      `${QWEN_API_BASE}/api/v2/files/parse`,
+      `${fileApiBase}/api/v2/files/parse`,
       { file_id: fileId },
       {
         headers: this.getApiHeaders(ticket),
@@ -425,7 +451,7 @@ export class QwenAdapter {
     const deadline = Date.now() + 15000
     while (Date.now() < deadline) {
       const statusRes = await axios.post(
-        `${QWEN_API_BASE}/api/v2/files/parse/status`,
+        `${fileApiBase}/api/v2/files/parse/status`,
         { file_id_list: [fileId] },
         {
           headers: this.getApiHeaders(ticket),
@@ -439,7 +465,7 @@ export class QwenAdapter {
       if (status === 'failed') throw new Error(`Qwen file parse failed for ${fileId}`)
       await new Promise((r) => setTimeout(r, 1000))
     }
-    console.warn('[Qwen] Parse poll timed out for', fileId)
+    console.warn('[Qwen] 文件解析轮询超时:', fileId)
   }
 
   /**
@@ -517,10 +543,15 @@ export class QwenAdapter {
       }
       const attachmentType: 'file' | 'image' = media.kind === 'image' ? 'image' : 'file'
       try {
-        const sts = await this.getStsToken(ticket, media.filename, media.size, attachmentType)
+        const { sts, fileApiBase } = await this.getStsToken(
+          ticket,
+          media.filename,
+          media.size,
+          attachmentType,
+        )
         await this.uploadToOss(sts, media.buffer, media.mimeType)
         if (attachmentType === 'file') {
-          await this.parseUploadedFile(ticket, sts.file_id)
+          await this.parseUploadedFile(ticket, sts.file_id, fileApiBase)
         }
         files.push(this.buildFileAttachment(sts, media, attachmentType))
         console.log('[Qwen] 已上传', media.filename, '→', sts.file_id)

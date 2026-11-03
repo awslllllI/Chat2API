@@ -161,20 +161,60 @@ export class ProviderChecker {
     }
   }
 
-  private static checkMimoToken(
+  /**
+   * Validate MiMo cookies against a real upstream endpoint (not field-presence only).
+   */
+  private static async checkMimoToken(
     serviceToken: string,
     userId: string,
     phToken: string
-  ): TokenCheckResult {
+  ): Promise<TokenCheckResult> {
     if (!serviceToken || !userId || !phToken) {
       return { valid: false, error: 'Missing required credentials: service_token, user_id, ph_token' }
     }
 
-    return {
-      valid: true,
-      userInfo: {
-        name: 'Mimo User',
-      },
+    try {
+      const url = `https://aistudio.xiaomimimo.com/open-apis/resource/genUploadInfo?xiaomichatbot_ph=${encodeURIComponent(phToken)}`
+      const response = await axios.post(
+        url,
+        {
+          fileName: 'probe.png',
+          fileSize: 16,
+          contentType: 'image/png',
+        },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            Cookie: `serviceToken=${serviceToken}; userId=${userId}; xiaomichatbot_ph=${phToken}`,
+            Origin: 'https://aistudio.xiaomimimo.com',
+            Referer: 'https://aistudio.xiaomimimo.com/',
+          },
+          timeout: CHECK_TIMEOUT,
+          validateStatus: () => true,
+        },
+      )
+
+      if (response.status === 401 || response.data?.code === 401) {
+        return { valid: false, error: 'MiMo 登录已失效，请重新登录后粘贴 service_token / user_id / ph_token' }
+      }
+
+      // 200 with upload URL, or other business errors still mean cookies are accepted
+      if (response.status >= 200 && response.status < 300) {
+        return {
+          valid: true,
+          userInfo: { name: 'Mimo User', id: userId },
+        }
+      }
+
+      return {
+        valid: false,
+        error: `MiMo 校验失败: HTTP ${response.status} ${JSON.stringify(response.data)?.slice(0, 120)}`,
+      }
+    } catch (error) {
+      return {
+        valid: false,
+        error: error instanceof AxiosError ? error.message : 'Connection failed',
+      }
     }
   }
 
@@ -414,7 +454,11 @@ export class ProviderChecker {
       const timestamp = Math.floor(Date.now() / 1000)
       const dataJson = JSON.stringify({ uuid })
       
-      const signature = crypto.createHash('md5').update(`${timestamp}${jwtToken}${dataJson}`).digest('hex')
+      // Match official web client: md5(timestamp + salt + bodyJson)
+      const signature = crypto
+        .createHash('md5')
+        .update(`${timestamp}I*7Cf%WZ#S&%1RlZJ&C2${dataJson}`)
+        .digest('hex')
       
       const queryParams = new URLSearchParams({
         device_platform: 'web',
